@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environment
+env/
+.venv/
+venv/
+
+# Logs and run artifacts
+logs/
+wandb/
+trainer_output/
+*.log
+*.jsonl
+
+# Models and checkpoints
+models/
+*.ckpt
+*.pt
+*.safetensors
+*.bin
+
+# Docker
+**/Dockerfile
+docker-compose.override.yml
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+
+# macOS
+.DS_Store
+
+# Ignore archives
+*.tar
+*.tar.gz
+*.tgz
+
+# Others
+dist/
+build/
+coverage/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Local config and secrets
+app/config.local.yaml
+.env
+.env.*

@@ -1,0 +1,24 @@
+{
+  "name": "rl-trainer",
+  "dockerComposeFile": "../docker-compose.yml",
+  "service": "trainer",
+  "workspaceFolder": "/workspace",
+  "runServices": ["trainer"],
+  "overrideCommand": false,
+  "remoteUser": "root",
+  "postCreateCommand": "python -c \"import torch;print('CUDA:', torch.cuda.is_available())\"",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-azuretools.vscode-docker"
+      ],
+      "settings": {
+        "python.analysis.typeCheckingMode": "basic",
+        "python.defaultInterpreterPath": "/usr/bin/python",
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  }
+}

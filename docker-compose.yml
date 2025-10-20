@@ -1,0 +1,65 @@
+version: "3.9"
+services:
+  trainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rl-convo:latest
+    container_name: rl-trainer
+    user: "0:0"
+    command: [ "bash", "-lc", "sleep infinity" ]
+    tty: true
+    stdin_open: true
+    working_dir: /workspace
+    volumes:
+      - ./app:/workspace/app
+      - ./models:/workspace/models
+      - ./logs:/workspace/logs
+    environment:
+      # 人間3台のエンドポイント（A/B/C の順）
+      - OLLAMA_BASES=http://ollama_a:11434,http://ollama_b:11434,http://ollama_c:11434
+      - OLLAMA_BASE=http://ollama_a:11434
+      # 学習用GPUは 0,1,2,3 を使用（PyTorch 側の可視デバイスを一致させる）
+      - CUDA_VISIBLE_DEVICES=0,1,2,3
+      - OLLAMA_SCORER_BASE=http://ollama_d:11434
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+      - NVIDIA_VISIBLE_DEVICES=0,1,2,3
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+  # 人間A
+  ollama_a:
+    image: ollama/ollama:latest
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+      - NVIDIA_VISIBLE_DEVICES=4
+    ports:
+      - "11434:11434"
+
+  # 人間B
+  ollama_b:
+    image: ollama/ollama:latest
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+      - NVIDIA_VISIBLE_DEVICES=4
+    ports:
+      - "11435:11434"
+
+  # 人間C
+  ollama_c:
+    image: ollama/ollama:latest
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+      - NVIDIA_VISIBLE_DEVICES=5
+    ports:
+      - "11436:11434"
+
+  # 関係性推定（120B）
+  ollama_d:
+    image: ollama/ollama:latest
+    runtime: nvidia
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+      - NVIDIA_VISIBLE_DEVICES=5
+
+volumes:
+  ollama:
