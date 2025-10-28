@@ -15,7 +15,7 @@ import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:128")  # 断片化対策
 import dataclasses
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 from functools import lru_cache
 import types
 import json
@@ -527,6 +527,7 @@ _THINK_CLOSE_TAG = "</think>"
 
 
 def _strip_think_tags(text: str) -> str:
+    """<think> タグで囲まれた内側のテキストを削除する。"""
     if not text:
         return text
     lowered = text.lower()
@@ -773,6 +774,9 @@ def _default_model_name() -> str | None:
         return None
 
 
+_PLANNER_STRATEGIES = ("reframe", "validate", "bridge")
+
+
 def build_robot_messages(
     logs: List[dict],
     personas: List[str],
@@ -780,100 +784,31 @@ def build_robot_messages(
     k: int | None = None,
     model_name: str | None = None,
 ):
-    """会話状態を構造化してロボット用のチャットテンプレートを構築する"""
+    """会話履歴と環境情報から介入計画用のプロンプトを構築する。"""
 
     history_limit = k
     if history_limit is None and env is not None:
         history_limit = getattr(env, "max_history", None)
     if history_limit is None:
-        history_limit = 10
+        history_limit = 12
     history_limit = max(1, int(history_limit))
 
-    ctx = [[l["speaker"], l["utterance"]] for l in logs[-history_limit:]]
-    persona_summary = "\n".join(personas) if personas else "A: 不明\nB: 不明\nC: 不明"
-
-    model_name = model_name or getattr(env, "base_model_id", None) or _default_model_name()
-    model_name_str = str(model_name) if model_name is not None else ""
-
-    if "unsloth/Qwen3" in model_name_str:
-        system_content = (
-            "\\no_think\n"
-            "あなたは会話参加者「D」です。目的は、A,B,Cの関係を安定化し会話を円滑にすることです。\n"
-            "会話の流れに沿った具体的な内容で、以下の優先順位を達成するためのDの発言を生成してください。\n"
-            "人間のような自然な言葉で応答してください。\n"
-            "優先順位: ① U→S（不安定→安定）を最大化 ② S→S（安定維持）を守る ③ S→U（安定→不安定）を避ける。\n"
-            "孤立している人間がいれば即時に巻き込みます。\n"
-            "禁止: メタ発言（AI/モデル/指示/スコア等への言及）、専門用語（バランス理論等）。\n"
-            "S=安定（感情が調和）、U=不安定（緊張や対立）。\n"
-            "出力仕様: 日本語/150文字以内"
-        )
-    else:
-        system_content = (
-            # "出力は日本語、一文でDになりきって、Dの発言部分のみを生成してください。\n"
-            "あなたは会話参加者「D」です。目的は、A,B,Cの関係を安定化し会話を円滑にすることです。\n"
-            "会話の流れに沿った具体的な内容で、以下の優先順位を達成するためのDの発言を生成してください。\n"
-            "優先順位: ① U→S（不安定→安定）を最大化 ② S→S（安定維持）を守る ③ S→U（安定→不安定）を避ける。\n"
-            "孤立している人間がいれば即時に巻き込みます。\n"
-            "禁止: メタ発言（AI/モデル/指示/スコア等への言及）、専門用語（バランス理論等）。\n"
-            "S=安定（感情が調和）、U=不安定（緊張や対立）。\n"
-            "出力仕様: 日本語/150文字以内"
-        )
-
-    human_labels = [p.split(":", 1)[0].strip() for p in personas] if personas else []
-    human_labels = [label for label in human_labels if label]
-
-    robot_label_env = "ロボット"
-    robot_display = "Dさん"
-
-    triangles_info = []
-    isolated_info = "なし"
-
-    if env is not None and hasattr(env, "relation_snapshot"):
-        snapshot = env.relation_snapshot()
-        triangles_map = {tuple(nodes): status for nodes, status in snapshot.get("triangles", {}).items()}
-        isolated_nodes = snapshot.get("isolated_humans", [])
-        snapshot_participants = snapshot.get("participants", [])
-        if not human_labels:
-            human_labels = [p for p in snapshot_participants if p != "ロボット"]
-        if isolated_nodes:
-            isolated_info = ",".join(robot_display if node == robot_label_env else node for node in isolated_nodes)
-
-        if human_labels:
-            human_tri_key = tuple(sorted(human_labels))
-            status = triangles_map.get(human_tri_key, "?")
-            triangles_info.append(
-                f"  人間三者: {{{','.join(human_labels)}}}: {status}"
-            )
-
-        from itertools import combinations
-
-        for pair in combinations(human_labels, 2):
-            key = tuple(sorted([robot_label_env, *pair]))
-            status = triangles_map.get(key, "?")
-            display_nodes = [robot_display if node == robot_label_env else node for node in [robot_label_env, *pair]]
-            triangles_info.append(
-                f"  {robot_display}入り: {{{','.join(display_nodes)}}}: {status}"
-            )
-
-    if not triangles_info:
-        triangles_info.append("  (情報なし)")
-
-    history_lines = [f"ー {speaker}: {utterance}" for speaker, utterance in ctx]
+    history_entries = logs[-history_limit:]
+    history_lines = [f"[{item.get('speaker', '?')}] {item.get('utterance', '').strip()}" for item in history_entries]
     if not history_lines:
-        history_lines.append("ー (まだ発言なし)")
+        history_lines.append("(履歴なし)")
 
-    user_lines = [
-        f"参加者: 人間=[{','.join(human_labels) if human_labels else 'A,B,C'}], D=[{robot_display}]",
-        "三角形（S=安定/U=不安定）:",
-        *triangles_info,
-        f"孤立ノード（人間のみ）: {isolated_info}",
-        "ログ:",
-        *history_lines,
-    ]
+    prompt_text: Optional[str] = None
+    if env is not None and hasattr(env, "_make_observation"):
+        try:
+            prompt_text = env._make_observation()
+        except Exception:
+            prompt_text = None
 
+    system_content = "あなたはロボットDの介入計画AIです。常に JSON だけを返してください。"
     messages = [
         {"role": "system", "content": system_content},
-        {"role": "user", "content": "\n".join(user_lines)},
+        {"role": "user", "content": prompt_text},
     ]
     return messages
 
@@ -896,8 +831,8 @@ class FiniteOnlineDataset(TorchIterableDataset):
         self._epoch = int(epoch)
     def __iter__(self):
         for _ in range(self.total_samples):
-            self.env.ensure_human_turn()
-            messages = self.build_messages_fn(self.env.logs, self.env.personas, env=self.env)
+            persona_list = list(getattr(self.env, "persona_pool", getattr(self.env, "personas", [])))
+            messages = self.build_messages_fn(self.env.logs, persona_list, env=self.env)
             if getattr(self.env, "debug_prompts", getattr(self.env, "debug", False)):
                 print("\n[ppo_train] === Prompt feed ===")
                 print(f"episode={self.env.episode}, turn={self.env.t}, total_steps={self.env.total_steps}")
@@ -1568,13 +1503,15 @@ def main():
         max_steps=cfg.env.max_steps,
         personas=cfg.env.personas,
         include_robot=cfg.env.include_robot,
-        ema_alpha=cfg.scorer.ema_alpha,
-        decay_factor=cfg.scorer.decay_factor,
-        backend=cfg.scorer.backend,
-        debug=cfg.env.debug,
-        prompt_debug=getattr(ppo_cfg, "prompt_feed_debug", None),
         max_history=cfg.env.max_history,
-        reward_backend=getattr(cfg.env, "reward_backend", None),
+        backend=cfg.scorer.backend,
+        decay_factor=cfg.scorer.decay_factor,
+        debug=cfg.env.debug,
+        reward_backend=getattr(cfg.env, "reward_backend", "rule"),
+        evaluation_horizon=cfg.env.evaluation_horizon,
+        time_penalty=cfg.env.time_penalty,
+        terminal_bonus=cfg.env.terminal_bonus,
+        intervention_cost=getattr(cfg.env, "intervention_cost", 0.02),
     )
 
     run_id = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
@@ -1585,9 +1522,8 @@ def main():
     training_logger.log_event(
         event="episode_start",
         episode=env.episode,
-        state=env._state(),
-        initial_humans=env.get_initial_humans(),
-        personas=list(env.personas),
+        state=env.planning_context(),
+        personas=list(getattr(env, "persona_pool", getattr(env, "personas", []))),
     )
     print(f"[LOG] training artifacts => {run_log_dir}")
     interaction_counter = itertools.count(start=1)
@@ -1633,75 +1569,34 @@ def main():
     # 報酬関数：生成テキストを環境に流し込み、Before→After のスコア差を返す
     # PPOTrainer 0.23 では `reward_model` 経由の計算が前提のため、後段で monkeypatch して利用する
     def reward_fn(samples, **kwargs):
-        rewards = []
-        fallback_penalty_value = float(
-            getattr(ppo_cfg, "fallback_penalty", getattr(ppo_cfg, "non_japanese_penalty", 0.0)) or 0.0
-        )
-        repetition_penalty_value = float(getattr(ppo_cfg, "repetition_penalty", 0.0) or 0.0)
-        repetition_lookback = int(getattr(ppo_cfg, "repetition_lookback", 1) or 1)
-        repetition_semantic_penalty_value = float(getattr(ppo_cfg, "repetition_semantic_penalty", 0.0) or 0.0)
-        repetition_semantic_threshold = float(getattr(ppo_cfg, "repetition_semantic_threshold", 0.9) or 0.9)
-        if repetition_semantic_threshold <= 0.0:
-            repetition_semantic_threshold = 0.9
-        repetition_semantic_threshold = min(max(repetition_semantic_threshold, 0.0), 0.999)
-        topic_similarity_weight = float(getattr(ppo_cfg, "topic_overlap_weight", 0.0) or 0.0)
-        topic_miss_penalty_value = float(getattr(ppo_cfg, "topic_miss_penalty", 0.0) or 0.0)
-        _threshold_raw = getattr(ppo_cfg, "topic_similarity_threshold", None)
-        if _threshold_raw is None:
-            _threshold_raw = getattr(ppo_cfg, "topic_overlap_min_tokens", 0.0)
-        topic_similarity_threshold = float(_threshold_raw or 0.0)
-        topic_overlap_horizon = max(0, int(getattr(ppo_cfg, "topic_overlap_horizon", 1) or 0))
-        azure_endpoint = getattr(cfg.openai, "azure_endpoint", None)
-        azure_embed_deployment = getattr(
-            cfg.openai,
-            "embedding_deployment",
-            getattr(ppo_cfg, "topic_embed_model_name", None),
-        )
-        azure_embed_api_version = (
-            getattr(cfg.openai, "embedding_api_version", None)
-            or getattr(cfg.openai, "azure_api_version", None)
-            or getattr(cfg.openai, "api_version", None)
-            or "2024-02-01"
-        )
-        azure_api_key = getattr(cfg.openai, "azure_api_key", None) or ""
-        brevity_penalty_value = float(getattr(ppo_cfg, "brevity_penalty", 0.0) or 0.0)
-        brevity_min_chars = max(0, int(getattr(ppo_cfg, "brevity_min_chars", 0) or 0))
-        topic_similarity_enabled = (
-            topic_overlap_horizon > 0
-            and (topic_similarity_weight != 0.0 or topic_miss_penalty_value != 0.0 or topic_similarity_threshold > 0.0)
-            and azure_endpoint
-            and azure_embed_deployment
-            and azure_api_key
-        )
+        rewards: List[float] = []
+
+        def _extract_plan_candidate(text: str) -> str:
+            # JSONっぽい部分を抜き出す
+            candidate = text.strip()
+            start = candidate.find("{")
+            end = candidate.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                snippet = candidate[start : end + 1]
+                try:
+                    json.loads(snippet)
+                    return snippet
+                except json.JSONDecodeError:
+                    pass
+            return candidate
+
         for resp in samples:
             raw_resp = resp or ""
             visible_resp = _strip_think_tags(raw_resp)
-            primary_candidate = _extract_primary_japanese_sentence(visible_resp)
-            preprocessed_candidate = _enforce_single_sentence(primary_candidate or "")
-            robot_response = _prepare_robot_response(raw_resp)
-            fallback_used = robot_response == _FALLBACK_SENTENCE and robot_response != preprocessed_candidate
-            history_before = [dict(l) for l in env.logs]
-            recent_robot_utts: list[str] = []
-            if repetition_penalty_value and repetition_lookback > 0:
-                for prev in reversed(history_before):
-                    if prev.get("speaker") != "ロボット":
-                        continue
-                    normalized = _prepare_robot_response(prev.get("utterance", ""))
-                    if normalized:
-                        recent_robot_utts.append(normalized)
-                    if len(recent_robot_utts) >= repetition_lookback:
-                        break
-            recent_human_utts: list[str] = []
-            if topic_similarity_enabled:
-                for prev in reversed(history_before):
-                    if prev.get("speaker") == "ロボット":
-                        continue
-                    utt = (prev.get("utterance") or "").strip()
-                    if utt:
-                        recent_human_utts.append(utt)
-                    if len(recent_human_utts) >= topic_overlap_horizon:
-                        break
-                recent_human_utts = list(reversed(recent_human_utts))
+            plan_text = _extract_plan_candidate(visible_resp)
+
+            history_before = [dict(entry) for entry in env.logs]
+            state_before = None
+            try:
+                state_before = env.planning_context()
+            except Exception:
+                state_before = None
+
             interaction_id = next(interaction_counter)
 
             if training_logger is not None:
@@ -1710,217 +1605,62 @@ def main():
                     episode=env.episode,
                     turn=env.t,
                     draft_response=raw_resp,
-                    sanitized_response=preprocessed_candidate,
-                    fallback_used=fallback_used,
+                    sanitized_response=plan_text,
                     history_before=history_before,
-                    personas=list(env.personas),
-                    state_before=env._state(),
+                    personas=list(getattr(env, "persona_pool", getattr(env, "personas", []))),
+                    state_before=state_before,
                 )
 
-            if fallback_used:
-                base_breakdown = {"fallback_penalty": fallback_penalty_value, "language_penalty": 0.0}
-                components = _extract_reward_components(base_breakdown)
-                total_reward = sum(components.values()) if components else float(fallback_penalty_value)
-                reward_summary = {
-                    "total": total_reward,
-                    "components": components,
-                }
-                triangle_summary = ""
-                if hasattr(env, "relation_snapshot"):
-                    try:
-                        triangle_summary = _format_triangle_summary(env.relation_snapshot())
-                    except Exception:
-                        triangle_summary = ""
-                log_payload = {
-                    "interaction_id": interaction_id,
-                    "episode": env.episode,
-                    "turn": env.t,
-                    "robot": {
-                        "utterance": robot_response,
-                        "flags": ["fallback"],
-                    },
-                    "humans": [],
-                    "reward": reward_summary,
-                    "done": False,
-                }
-                if triangle_summary:
-                    log_payload["triangle_summary"] = triangle_summary
-                training_logger.log_interaction(**log_payload)
-                rewards.append(total_reward)
-                continue
+            next_obs, reward_value, done, info = env.step(plan_text)
+            reward_details = info.get("reward_details", {}) or {}
+            components = _extract_reward_components(reward_details)
+            total_reward = float(reward_value)
+            if components:
+                total_reward = sum(components.values())
 
-            # 環境1ステップ進める（ロボット発話 = 生成テキスト）
-            state_after, r, done, info = env.step(robot_response)
-            history_after = [dict(l) for l in env.logs]
-            base_breakdown = dict(info.get("reward_breakdown", {}) or {})
-            language_penalty = 0.0
-            if repetition_penalty_value and recent_robot_utts:
-                if robot_response in recent_robot_utts:
-                    language_penalty += repetition_penalty_value
-                    base_breakdown["repeat_penalty"] = repetition_penalty_value
-                    base_breakdown["repeat_match_count"] = recent_robot_utts.count(robot_response)
-                    base_breakdown["repeat_lookback"] = len(recent_robot_utts)
-            if repetition_semantic_penalty_value > 0.0 and recent_robot_utts:
-                best_similarity = 0.0
-                for prev_resp in recent_robot_utts:
-                    if not prev_resp:
-                        continue
-                    best_similarity = max(best_similarity, _text_similarity(robot_response, prev_resp))
-                if best_similarity >= repetition_semantic_threshold:
-                    semantic_delta = max(0.0, best_similarity - repetition_semantic_threshold)
-                    semantic_penalty = -repetition_semantic_penalty_value * semantic_delta
-                    language_penalty += semantic_penalty
-                    base_breakdown["repeat_semantic_penalty"] = semantic_penalty
-                    base_breakdown["repeat_semantic_similarity"] = best_similarity
-                    base_breakdown["repeat_semantic_threshold"] = repetition_semantic_threshold
-            base_breakdown["language_penalty"] = language_penalty
-            components = _extract_reward_components(base_breakdown)
-            total_reward = sum(components.values()) if components else (float(r) + language_penalty)
-            reward_summary = {
-                "total": total_reward,
-                "components": components,
-            }
-
-            topic_similarity_log = None
-            if topic_similarity_enabled and recent_human_utts and robot_response:
-                helper_key = (str(azure_endpoint), str(azure_embed_deployment), str(azure_embed_api_version))
-                helper: Dict[str, Any] | None = None
-                try:
-                    helper = _get_azure_embedding_helper(
-                        endpoint=str(azure_endpoint),
-                        deployment=str(azure_embed_deployment),
-                        api_version=str(azure_embed_api_version),
-                        api_key=str(azure_api_key),
-                    )
-                    embeddings = _encode_embeddings_azure(
-                        [robot_response] + recent_human_utts,
-                        helper,
-                    )
-                except Exception as exc:
-                    if helper_key not in _AZURE_EMBED_FAILURES:
-                        _AZURE_EMBED_FAILURES.add(helper_key)
-                        print(f"[warn] semantic embedding failed for {helper_key}: {exc}")
-                        if training_logger is not None:
-                            training_logger.log_event(
-                                event="semantic_embedding_error",
-                                error=str(exc),
-                                endpoint=str(azure_endpoint),
-                                deployment=str(azure_embed_deployment),
-                            )
-                    embeddings = None
-                if embeddings is not None and embeddings.size(0) >= 2:
-                    robot_vec = embeddings[0]
-                    human_vecs = embeddings[1:]
-                    if human_vecs.size(0) > 0:
-                        similarities = torch.matmul(human_vecs, robot_vec)
-                        max_similarity = float(torch.max(similarities).item()) if similarities.numel() > 0 else 0.0
-                        mean_similarity = float(torch.mean(similarities).item()) if similarities.numel() > 0 else 0.0
-                        similarity_list = similarities.tolist()
-                    else:
-                        similarities = None
-                        max_similarity = 0.0
-                        mean_similarity = 0.0
-                        similarity_list = []
-
-                    topic_bonus = 0.0
-                    if topic_similarity_weight != 0.0 and similarities is not None and similarities.numel() > 0:
-                        topic_bonus = topic_similarity_weight * max_similarity
-                        if topic_bonus != 0.0:
-                            total_reward += topic_bonus
-                            base_breakdown["topic_similarity_bonus"] = topic_bonus
-                            base_breakdown["topic_similarity_max"] = max_similarity
-                            base_breakdown["topic_similarity_mean"] = mean_similarity
-
-                    topic_penalty_applied = 0.0
-                    if (
-                        topic_miss_penalty_value != 0.0
-                        and similarities is not None
-                        and similarities.numel() > 0
-                        and max_similarity < topic_similarity_threshold
-                    ):
-                        topic_penalty_applied = topic_miss_penalty_value
-                        total_reward += topic_penalty_applied
-                        base_breakdown["topic_similarity_penalty"] = topic_penalty_applied
-                        base_breakdown["topic_similarity_threshold"] = topic_similarity_threshold
-
-                    if (similarities is not None and similarities.numel() > 0) or topic_bonus != 0.0 or topic_penalty_applied != 0.0:
-                        topic_similarity_log = {
-                            "endpoint": str(azure_endpoint),
-                            "deployment": str(azure_embed_deployment),
-                            "api_version": str(azure_embed_api_version),
-                            "max_similarity": max_similarity,
-                            "mean_similarity": mean_similarity,
-                            "threshold": topic_similarity_threshold,
-                            "bonus": topic_bonus,
-                            "penalty": topic_penalty_applied,
-                            "horizon": topic_overlap_horizon,
-                            "per_human": [
-                                {
-                                    "utterance": utt,
-                                    "similarity": float(sim),
-                                }
-                                for utt, sim in zip(recent_human_utts, similarity_list)
-                            ],
-                        }
-
-            brevity_log = None
-            if brevity_penalty_value != 0.0 and brevity_min_chars > 0:
-                visible_chars = len(re.sub(r"\s+", "", robot_response))
-                if visible_chars < brevity_min_chars:
-                    total_reward += brevity_penalty_value
-                    base_breakdown["brevity_penalty"] = brevity_penalty_value
-                    base_breakdown["brevity_min_chars"] = brevity_min_chars
-                    base_breakdown["brevity_char_count"] = visible_chars
-                    brevity_log = {
-                        "applied": True,
-                        "value": brevity_penalty_value,
-                        "char_count": visible_chars,
-                        "min_required": brevity_min_chars,
-                    }
-                else:
-                    brevity_log = {
-                        "applied": False,
-                        "value": 0.0,
-                        "char_count": visible_chars,
-                        "min_required": brevity_min_chars,
-                    }
-
-            log_payload = {
+            log_payload: Dict[str, Any] = {
                 "interaction_id": interaction_id,
                 "episode": env.episode,
                 "turn": env.t,
-                "robot": {
-                    "utterance": robot_response,
+                "plan": info.get("plan"),
+                "plan_error": info.get("plan_error"),
+                "reward": {
+                    "total": total_reward,
+                    "components": components,
                 },
-                "humans": info.get("replies", []),
-                "reward": reward_summary,
                 "done": bool(done),
             }
-            triangle_summary = _format_triangle_summary(info.get("rel"))
-            if triangle_summary:
-                log_payload["triangle_summary"] = triangle_summary
-            if fallback_used:
-                log_payload.setdefault("robot", {}).setdefault("flags", []).append("fallback")
+            if reward_details:
+                log_payload.setdefault("reward_details", reward_details)
+            if info.get("balanced") is not None:
+                log_payload.setdefault("status", {}).update({"balanced": info["balanced"]})
+            if next_obs is not None:
+                log_payload.setdefault("next_observation", next_obs)
             training_logger.log_interaction(**log_payload)
+
             rewards.append(total_reward)
+
             if done:
                 current_episode = env.episode
+                try:
+                    env_metrics = env.relation_snapshot()
+                except Exception:
+                    env_metrics = {}
                 training_logger.log_event(
                     event="episode_end",
                     episode=current_episode,
                     reward=total_reward,
-                    env_metrics=info.get("rel", {}),
-                    reward_breakdown=base_breakdown,
-                    personas=list(env.personas),
+                    env_metrics=env_metrics,
+                    reward_breakdown=reward_details,
+                    personas=list(getattr(env, "persona_pool", getattr(env, "personas", []))),
                     total_steps=env.total_steps,
                 )
-                next_state = env.reset()
+                env.reset()
                 training_logger.log_event(
                     event="episode_start",
                     episode=env.episode,
-                    state=next_state,
-                    initial_humans=env.get_initial_humans(),
-                    personas=list(env.personas),
+                    state=env.planning_context(),
+                    personas=list(getattr(env, "persona_pool", getattr(env, "personas", []))),
                 )
         return rewards
 

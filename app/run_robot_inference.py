@@ -536,22 +536,6 @@ def main():
         eos_token_id=tokenizer.eos_token_id,
     )
 
-    rep_penalty_cfg = getattr(ppo_cfg, "decode_repetition_penalty", None)
-    try:
-        repetition_penalty = float(rep_penalty_cfg) if rep_penalty_cfg is not None else 1.18
-    except (TypeError, ValueError):
-        repetition_penalty = 1.18
-    if repetition_penalty and repetition_penalty > 1.0:
-        generation_kwargs["repetition_penalty"] = repetition_penalty
-
-    no_repeat_cfg = getattr(ppo_cfg, "decode_no_repeat_ngram_size", None)
-    try:
-        no_repeat_ngram_size = int(no_repeat_cfg) if no_repeat_cfg is not None else 6
-    except (TypeError, ValueError):
-        no_repeat_ngram_size = 6
-    if no_repeat_ngram_size and no_repeat_ngram_size > 0:
-        generation_kwargs["no_repeat_ngram_size"] = no_repeat_ngram_size
-
     typical_p_cfg = getattr(ppo_cfg, "decode_typical_p", None)
     try:
         typical_p_val = float(typical_p_cfg) if typical_p_cfg is not None else 0.95
@@ -572,11 +556,15 @@ def main():
         max_steps=cfg.env.max_steps,
         personas=cfg.env.personas,
         include_robot=cfg.env.include_robot,
-        ema_alpha=cfg.scorer.ema_alpha,
         decay_factor=cfg.scorer.decay_factor,
         backend=cfg.scorer.backend,
         debug=True,
         max_history=cfg.env.max_history,
+        reward_backend=getattr(cfg.env, "reward_backend", "rule"),
+        evaluation_horizon=cfg.env.evaluation_horizon,
+        time_penalty=cfg.env.time_penalty,
+        terminal_bonus=cfg.env.terminal_bonus,
+        intervention_cost=getattr(cfg.env, "intervention_cost", 0.02),
     )
 
     all_logs = []

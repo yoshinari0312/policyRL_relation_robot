@@ -29,23 +29,27 @@ class OllamaCfg:
 
 
 @dataclass
-class OpenAICfg:
-    api_key: Optional[str] = None
-    model: Optional[str] = None
-    api_version: Optional[str] = None
+class LLMCfg:
+    provider: Optional[str] = None
     azure_endpoint: Optional[str] = None
     azure_api_key: Optional[str] = None
     azure_api_version: Optional[str] = None
-    embedding_deployment: Optional[str] = None
-    embedding_api_version: Optional[str] = None
+    azure_model: Optional[str] = None
+    azure_embedding_deployment: Optional[str] = None
+    azure_embedding_api_version: Optional[str] = None
 
 
 @dataclass
 class ScorerCfg:
     backend: Optional[str] = None   # "rule" | "ollama" | "openai"
     use_ema: Optional[bool] = None
-    ema_alpha: Optional[float] = None
     decay_factor: Optional[float] = None
+
+
+@dataclass
+class TopicManagerCfg:
+    enable: Optional[bool] = None
+    generation_prompt: Optional[str] = None
 
 
 @dataclass
@@ -53,11 +57,17 @@ class EnvCfg:
     max_steps: Optional[int] = None
     include_robot: Optional[bool] = None
     max_history: Optional[int] = None
-    personas: Optional[List[str]] = None
+    personas: Optional[Any] = None  # List[str] または Dict[str, Dict[str, Any]]（triggers含む）
     ref_device: Optional[Any] = None
     ref_device_map: Optional[Dict[Any, Any]] = None
     debug: Optional[bool] = None
     reward_backend: Optional[str] = None
+    evaluation_horizon: Optional[int] = None
+    time_penalty: Optional[float] = None
+    terminal_bonus: Optional[float] = None
+    intervention_cost: Optional[float] = None
+    min_robot_intervention_lookback: Optional[int] = None
+    terminal_bonus_duration: Optional[int] = None
 
 
 @dataclass
@@ -83,14 +93,8 @@ class PPOCfg:
     kl_adjust_down: Optional[float] = None
     cliprange: Optional[float] = None
     cliprange_value: Optional[float] = None
-    decode_repetition_penalty: Optional[float] = None
-    decode_no_repeat_ngram_size: Optional[int] = None
     decode_typical_p: Optional[float] = None
     decode_min_p: Optional[float] = None
-    similarity_retry_threshold: Optional[float] = None
-    similarity_retry_max_attempts: Optional[int] = None
-    repetition_semantic_penalty: Optional[float] = None
-    repetition_semantic_threshold: Optional[float] = None
 
     max_new_tokens: Optional[int] = None
     temperature: Optional[float] = None
@@ -107,8 +111,6 @@ class PPOCfg:
     episode_len: Optional[int] = None
     missing_eos_penalty: Optional[float] = None
     non_japanese_penalty: Optional[float] = None
-    repetition_penalty: Optional[float] = None
-    repetition_lookback: Optional[int] = None
     entropy_floor: Optional[float] = None
     entropy_patience: Optional[int] = None
     entropy_monitor_warmup: Optional[int] = None
@@ -129,8 +131,9 @@ class AppConfig:
     env: EnvCfg = field(default_factory=EnvCfg)
     scorer: ScorerCfg = field(default_factory=ScorerCfg)
     ollama: OllamaCfg = field(default_factory=OllamaCfg)
-    openai: OpenAICfg = field(default_factory=OpenAICfg)
+    llm: LLMCfg = field(default_factory=LLMCfg)
     ppo: PPOCfg = field(default_factory=PPOCfg)
+    topic_manager: TopicManagerCfg = field(default_factory=TopicManagerCfg)
 
 
 def _filter_kwargs(cls, dct: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -162,16 +165,22 @@ def _validate_required_fields(cfg: AppConfig) -> None:
         if missing:
             missing_sections.append(f"{section}: {', '.join(missing)}")
 
-    _require("env", cfg.env, ["max_steps", "include_robot", "max_history", "personas", "debug"])
-    _require("scorer", cfg.scorer, ["backend", "use_ema", "ema_alpha", "decay_factor"])
+    _require("env", cfg.env, ["max_steps", "include_robot", "max_history", "debug"])
+    _require("scorer", cfg.scorer, ["backend", "use_ema", "decay_factor"])
     _require("ollama", cfg.ollama, ["model"])
     _require("ollama.gen_options", getattr(cfg.ollama, "gen_options", None), ["temperature", "top_p", "num_ctx"])
-    _require("openai", cfg.openai, ["api_key", "model"])
-    _require(
-        "openai.azure",
-        cfg.openai,
-        ["azure_endpoint", "azure_api_key", "azure_api_version", "embedding_deployment", "embedding_api_version"],
-    )
+    _require("llm", cfg.llm, ["provider"])
+    if (cfg.llm.provider or "").lower() == "azure":
+        _require(
+            "llm.azure",
+            cfg.llm,
+            ["azure_endpoint", "azure_api_key", "azure_api_version", "azure_model"],
+        )
+        _require(
+            "llm.azure.embedding",
+            cfg.llm,
+            ["azure_embedding_deployment", "azure_embedding_api_version"],
+        )
     _require(
         "ppo",
         cfg.ppo,
@@ -194,8 +203,6 @@ def _validate_required_fields(cfg: AppConfig) -> None:
             "episode_len",
             "missing_eos_penalty",
             "non_japanese_penalty",
-            "repetition_penalty",
-            "repetition_lookback",
             "output_dir",
         ],
     )
@@ -209,6 +216,11 @@ def load_config(yaml_path: str = "config.local.yaml") -> AppConfig:
     """config.local.yaml を（あれば）読み、既定値にマージして AppConfig を返す"""
     cfg = AppConfig()  # 既定値
 
+    # 相対パスの場合、このファイル(config.py)があるディレクトリを基準に探す
+    if not os.path.isabs(yaml_path):
+        config_dir = os.path.dirname(os.path.abspath(__file__))
+        yaml_path = os.path.join(config_dir, yaml_path)
+
     if yaml and os.path.exists(yaml_path):
         # 前段で UTF-8 化済み想定
         with open(yaml_path, "r", encoding="utf-8") as f:
@@ -217,17 +229,41 @@ def load_config(yaml_path: str = "config.local.yaml") -> AppConfig:
         y = {}
 
     # セクション毎に安全マージ
-    env = EnvCfg(**_filter_kwargs(EnvCfg, y.get("env")))
+    env_dict = dict(y.get("env") or {})
+
+    # 後方互換性: トップレベルのpersonasをenv.personasにマッピング
+    legacy_personas = y.get("personas")
+    if legacy_personas and "personas" not in env_dict:
+        env_dict["personas"] = legacy_personas
+
+    env = EnvCfg(**_filter_kwargs(EnvCfg, env_dict))
     scorer = ScorerCfg(**_filter_kwargs(ScorerCfg, y.get("scorer")))
     ollama_dict = y.get("ollama") or {}
     ollama_gen = OllamaGenOpts(**_filter_kwargs(OllamaGenOpts, (ollama_dict.get("gen_options") or {})))
     ollama = OllamaCfg(
         **_filter_kwargs(OllamaCfg, {**ollama_dict, "gen_options": ollama_gen})
     )
-    openai = OpenAICfg(**_filter_kwargs(OpenAICfg, y.get("openai")))
-    ppo = PPOCfg(**_filter_kwargs(PPOCfg, y.get("ppo")))
 
-    app_cfg = AppConfig(env=env, scorer=scorer, ollama=ollama, openai=openai, ppo=ppo)
+    llm_raw = dict(y.get("llm") or {})
+    legacy_openai = y.get("openai") or {}
+    legacy_planner = y.get("azure_planner") or {}
+
+    if legacy_openai:
+        llm_raw.setdefault("provider", legacy_openai.get("provider") or "azure")
+        llm_raw.setdefault("azure_endpoint", legacy_openai.get("azure_endpoint"))
+        llm_raw.setdefault("azure_api_key", legacy_openai.get("azure_api_key") or legacy_openai.get("api_key"))
+        llm_raw.setdefault("azure_api_version", legacy_openai.get("azure_api_version") or legacy_openai.get("api_version"))
+        llm_raw.setdefault("azure_model", legacy_openai.get("azure_model") or legacy_openai.get("model"))
+        llm_raw.setdefault("azure_embedding_deployment", legacy_openai.get("embedding_deployment"))
+        llm_raw.setdefault("azure_embedding_api_version", legacy_openai.get("embedding_api_version") or legacy_openai.get("azure_api_version"))
+    if legacy_planner:
+        llm_raw.setdefault("azure_endpoint", legacy_planner.get("endpoint"))
+
+    llm = LLMCfg(**_filter_kwargs(LLMCfg, llm_raw))
+    ppo = PPOCfg(**_filter_kwargs(PPOCfg, y.get("ppo")))
+    topic_manager = TopicManagerCfg(**_filter_kwargs(TopicManagerCfg, y.get("topic_manager")))
+
+    app_cfg = AppConfig(env=env, scorer=scorer, ollama=ollama, llm=llm, ppo=ppo, topic_manager=topic_manager)
     _validate_required_fields(app_cfg)
     return app_cfg
 

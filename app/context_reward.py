@@ -128,7 +128,7 @@ def score_context_alignment(
     personas: List[str],
     debug: bool = False,
 ) -> Tuple[float, Dict[str, Any]]:
-    """Return (score, details) where score is a float within 0-10."""
+    """会話ログに対して、ロボット発話の文脈適合性を Ollama LLM で評価しスコアを返す。"""
     details: Dict[str, Any] = {
         "model": _OLLAMA_MODEL,
     }

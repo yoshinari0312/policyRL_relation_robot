@@ -11,10 +11,15 @@ def main():
         max_steps=cfg.env.max_steps,
         personas=personas,
         include_robot=cfg.env.include_robot,
-        ema_alpha=cfg.scorer.ema_alpha,
+        max_history=cfg.env.max_history,
         decay_factor=cfg.scorer.decay_factor,
         backend=backend,
         debug=cfg.env.debug,
+        reward_backend=getattr(cfg.env, "reward_backend", "rule"),
+        evaluation_horizon=cfg.env.evaluation_horizon,
+        time_penalty=cfg.env.time_penalty,
+        terminal_bonus=cfg.env.terminal_bonus,
+        intervention_cost=getattr(cfg.env, "intervention_cost", 0.02),
     )
 
     state = env.reset()

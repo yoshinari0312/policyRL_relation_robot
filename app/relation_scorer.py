@@ -1,16 +1,17 @@
 from __future__ import annotations
-from typing import Dict, List, Tuple
-import os, itertools, time, random, re
+from typing import Dict, List, Tuple, Optional
+import os, itertools, time, random, re, hashlib, json
 from collections import defaultdict, deque
 from pprint import pformat
 from config import get_config
+from azure_clients import get_azure_chat_completion_client, build_chat_completion_params
+from utils import call_ollama_generate
 
 # ===== 設定（config集中管理） =====
 _CFG = get_config()
 BACKEND = _CFG.scorer.backend.lower()
 OLLAMA_MODEL = getattr(_CFG.ollama, "model_rl", None) or _CFG.ollama.model
-OPENAI_MODEL   = _CFG.openai.model
-OPENAI_API_KEY = _CFG.openai.api_key
+LLM_CFG = _CFG.llm
 
 def _pick_ollama_base():
     scorer_base_env = os.getenv("OLLAMA_SCORER_BASE")
@@ -61,18 +62,6 @@ def _clip(x: float, lo=-1.0, hi=1.0) -> float:
     """-1.0〜+1.0 に丸める"""
     return float(max(lo, min(hi, x)))
 
-def _retry(n=3, backoff=1.0):
-    def deco(fn):
-        def wrap(*a, **kw):
-            last=None
-            for i in range(n):
-                try: return fn(*a, **kw)
-                except Exception as e:
-                    last=e; time.sleep(backoff*(i+1))
-            raise last
-        return wrap
-    return deco
-
 # ===== ルールベース（無料） =====
 def _scores_rule(logs: List[Dict], participants: List[str]) -> Dict[Tuple[str,str], float]:
     """単純ルールベースでペアスコアを推定"""
@@ -90,16 +79,6 @@ def _scores_rule(logs: List[Dict], participants: List[str]) -> Dict[Tuple[str,st
     return scores
 
 # ===== Ollama（無料・デフォルト） =====
-@_retry()
-def _ollama_generate(prompt: str) -> str:
-    """Ollama /api/generate を叩いて一括応答を返す（ストリームなし）。簡易リトライ付き。"""
-    import requests
-    r = requests.post(f"{OLLAMA_BASE}/api/generate",
-                      json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
-                      timeout=120)
-    r.raise_for_status()
-    return r.json().get("response","").strip()
-
 def _scores_ollama(logs: List[Dict], participants: List[str]) -> Dict[Tuple[str,str], float]:
     """Ollama ベースでペアスコアを推定"""
     conv = "\n".join([f"[{L['speaker']}] {L['utterance']}" for L in logs])
@@ -121,19 +100,18 @@ def _scores_ollama(logs: List[Dict], participants: List[str]) -> Dict[Tuple[str,
 出力形式（値だけをコロンの右に記す）:
 {outlines}
 """
-    return _parse_score_lines(_ollama_generate(prompt), participants)
+    response_text = call_ollama_generate(
+        prompt=prompt,
+        base_url=OLLAMA_BASE,
+        model=OLLAMA_MODEL,
+        timeout=120,
+        max_attempts=3
+    )
+    return _parse_score_lines(response_text, participants)
 
-# ===== OpenAI =====
-def _openai_client():
-    """OpenAI クライアントを生成"""
-    from openai import OpenAI
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY が未設定です。")
-    return OpenAI(api_key=OPENAI_API_KEY)
-
-def _scores_openai(logs: List[Dict], participants: List[str]) -> Dict[Tuple[str,str], float]:
-    """OpenAI ベースでペアスコアを推定"""
-    client = _openai_client()
+# ===== Azure (OpenAI compatible) =====
+def _scores_azure(logs: List[Dict], participants: List[str]) -> Dict[Tuple[str,str], float]:
+    """Azure OpenAI 経由でペアスコアを推定"""
     conv = "\n".join([f"[{L['speaker']}] {L['utterance']}" for L in logs])
     plines = "\n".join([f"- {a} × {b}" for a,b in _pairs(participants)])
     outlines = "\n".join([f"{a}-{b}:" for a,b in _pairs(participants)])
@@ -159,13 +137,43 @@ def _scores_openai(logs: List[Dict], participants: List[str]) -> Dict[Tuple[str,
 出力形式（値だけをコロンの右に記す）:
 {outlines}
 """
-    res = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[{"role":"user","content":prompt}],
-        temperature=0.2,
-    )
-    txt = res.choices[0].message.content
-    return _parse_score_lines(txt, participants)
+    client, deployment = get_azure_chat_completion_client(LLM_CFG, model_type="relation")
+    max_attempts = getattr(_CFG.llm, "max_attempts", 5) or 5
+    base_backoff = getattr(_CFG.llm, "base_backoff", 0.5) or 0.5
+    if client and deployment:
+        messages = [{"role": "user", "content": prompt}]
+        for attempt in range(1, max_attempts + 1):
+            try:
+                # GPT-5の場合はreasoningパラメータを追加
+                params = build_chat_completion_params(deployment, messages, LLM_CFG)
+                res = client.chat.completions.create(**params)
+                if res and getattr(res, "choices", None):
+                    choice = res.choices[0]
+                    message = getattr(choice, "message", None)
+                    if isinstance(message, dict):
+                        txt = message.get("content", "")
+                    else:
+                        txt = getattr(message, "content", "")
+                    txt = (txt or "").strip()
+                    if txt:
+                        # Azure の生テキスト出力をパースして辞書を返す
+                        return _parse_score_lines(txt, participants)
+            except Exception as exc:
+                if getattr(_CFG.env, "debug", False):
+                    print(f"[relation_scorer] attempt {attempt} failed:", exc)
+                if attempt < max_attempts:
+                    time.sleep(base_backoff * (2 ** (attempt - 1)))
+                else:
+                    if getattr(_CFG.env, "debug", False):
+                        print("[relation_scorer] all attempts failed, falling back to local heuristic")
+        # ここまで来たら Azure 呼び出しは全て失敗した
+        # 強制エラーにせず、ローカルのヒューリスティックにフォールバックする
+        if getattr(_CFG.env, "debug", False):
+            print("[relation_scorer] Azure failed after retries -> falling back to rule-based scorer")
+        return _scores_rule(logs, participants)
+    else:
+        # client/deployment が取得できなかった場合は明示的にエラー
+        raise RuntimeError("Azure relation scorer not configured (client/deployment missing)")
 
 # ===== 共通: パース & 完成 =====
 def _parse_score_lines(text: str, participants: List[str]) -> Dict[Tuple[str,str], float]:
@@ -191,11 +199,12 @@ class RelationScorer:
     """
     会話ログからペアスコア(-1..+1)を推定。EMAで平滑化可能。
     """
-    def __init__(self, backend: str|None=None, use_ema: bool=True, alpha: float=0.8, decay_factor: float = 1.5, verbose: bool=False):
+    def __init__(self, backend: str|None=None, use_ema: bool=False, decay_factor: float = 1.5, verbose: bool=False, use_delta_session: bool=True):
         self.backend = (backend or BACKEND).lower()
         self.use_ema = use_ema
-        # 既存互換: alpha 引数は残すが、動的 α（decay_factor×発話比）を優先して用いる
-        self.alpha = float(alpha)
+        # use_delta_session: True (既定) は既存の差分ベースのカウント方式
+        # False にするとセッション内発話数を絶対カウント（min(count[a], count[b])）で扱う
+        self.use_delta_session = bool(use_delta_session)
         # 既存 community_analyzer.py と同じ内部状態
         self.scores: Dict[Tuple[str, str], float] = defaultdict(float)  # EMA後の保持値
         self.history: Dict[Tuple[str, str], deque] = defaultdict(lambda: deque(maxlen=3))  # ペアごとの過去発話数（最大3件）
@@ -204,11 +213,22 @@ class RelationScorer:
         # 直前更新時点の「話者ごとの累積発話数」を保持（差分で session_utterance を出すため）
         # 例: {"A": 1, "B": 1, "ロボット": 1}
         self._last_totals: Dict[str, int] = defaultdict(int)
+        # キャッシュ: 最後に計算したログのハッシュと結果を保存
+        self._last_logs_hash: Optional[str] = None
+        self._last_scores_cache: Optional[Dict[Tuple[str, str], float]] = None
+
+    def _compute_logs_hash(self, logs: List[Dict], participants: List[str]) -> str:
+        """ログと参加者のハッシュを計算（キャッシュ判定用）"""
+        # ログの内容を文字列化してハッシュ化
+        log_str = json.dumps(logs, sort_keys=True, ensure_ascii=False)
+        participants_str = json.dumps(sorted(participants), ensure_ascii=False)
+        combined = f"{log_str}|{participants_str}"
+        return hashlib.md5(combined.encode('utf-8')).hexdigest()
 
     def _instant(self, logs: List[Dict], participants: List[str]) -> Dict[Tuple[str,str], float]:
         """会話ログからペアスコアを一回だけ推定"""
-        if self.backend == "openai":
-            return _scores_openai(logs, participants)
+        if self.backend == "azure":
+            return _scores_azure(logs, participants)
         if self.backend == "ollama":
             return _scores_ollama(logs, participants)
         return _scores_rule(logs, participants)
@@ -255,21 +275,49 @@ class RelationScorer:
         trace: List[str] = []
         trace.append(f"👥 参加者: {participants}")
 
-        # === 読み取り専用（事前）モード：内部EMAを一切再計算せず、保存済み値を返す ===
+        # ログのハッシュを計算
+        current_logs_hash = self._compute_logs_hash(norm_logs, participants)
+
+        # === 読み取り専用（事前）モード：ログが同じならキャッシュを返す、違えば再計算 ===
         if not update_state:
+            # ログが前回と同じならキャッシュを返す
+            if (self._last_logs_hash == current_logs_hash and
+                self._last_scores_cache is not None):
+                trace.append("（キャッシュ）前回と同じログ: キャッシュされたスコアを返却")
+                return (self._last_scores_cache, trace) if return_trace else self._last_scores_cache
+
+            # ログが違う場合は再計算（ただし内部状態は更新しない）
             out: Dict[Tuple[str, str], float] = {}
             for a, b in _pairs(participants):
                 key = tuple(sorted((_norm_speaker(a), _norm_speaker(b))))
                 if self.use_ema:
-                    # 保存済みEMA値がなければ0.0返却（“再計算なし”を徹底）
+                    # 保存済みEMA値がなければ0.0返却
                     out[key] = self.scores.get(key, 0.0)
                 else:
-                    # EMA未使用時は即時推定を返す（必要なときのみ計算）
+                    # EMA未使用時は即時推定を返す
                     out[key] = self._instant(norm_logs, participants).get((a, b), 0.0)
-            trace.append("（参照）事前スナップショット: 保存済みスコアを返却（再計算なし）")
+            trace.append("（参照）ログ変更検出: 保存済みスコアを返却（EMA状態は更新しない）")
             return (out, trace) if return_trace else out
         
         inst = self._instant(norm_logs, participants)
+        # 安全性チェック: _instant は必ず dict を返すことを期待する
+        if not isinstance(inst, dict):
+            raise TypeError(f"relation_scorer._instant returned {type(inst).__name__}, expected dict")
+
+        # === EMA を使用しない場合は、即時スコアをそのまま返す ===
+        if not self.use_ema:
+            trace.append("⚡ EMA disabled: returning instant (backend) scores")
+            # update_state=True のときは保存済みスコアを最新に更新（履歴はクリア）
+            if update_state:
+                self.scores = defaultdict(float, inst)
+                self.history = defaultdict(lambda: deque(maxlen=3))
+                self._last_totals = defaultdict(int)
+            trace.append(f"📊 即時スコア（最終）: {pformat(inst)}")
+            if self.verbose:
+                print("[RelationScorer] EMA trace (disabled):")
+                for line in trace:
+                    print(line)
+            return (inst, trace) if return_trace else inst
 
         # === ここから通常（事後）モード：EMAを更新して返す ===
         # セッション内の発話数カウント（話者別）
@@ -280,16 +328,26 @@ class RelationScorer:
                 utterance_counts[sp] += 1
         trace.append(f"🗣️ 発話数: {dict(utterance_counts)}")
         trace.append(f"🧠 即時スコア: {pformat(inst)}")
+        trace.append(f"🔧 session mode: {'delta' if self.use_delta_session else 'absolute'}")
 
         out: Dict[Tuple[str, str], float] = {}
         for (a, b), x_t in inst.items():
             key = tuple(sorted((_norm_speaker(a), _norm_speaker(b))))
-            # 直前スナップショットとの差分から「今回のステップ増分」を計算
-            da = max(0, utterance_counts.get(a, 0) - self._last_totals.get(a, 0))
-            db = max(0, utterance_counts.get(b, 0) - self._last_totals.get(b, 0))
-            session_utterance = min(da, db)
             past_utterances = self.history[key]
             total_past = sum(past_utterances)
+            # 直前スナップショットとの差分から「今回のステップ増分」を計算
+            if self.use_delta_session:
+                da = max(0, utterance_counts.get(a, 0) - self._last_totals.get(a, 0))
+                db = max(0, utterance_counts.get(b, 0) - self._last_totals.get(b, 0))
+                session_utterance = min(da, db)
+            else:
+                # 絶対カウント方式: 今回セッションの発話数そのものの最小値を使う
+                da = utterance_counts.get(a, 0)
+                db = utterance_counts.get(b, 0)
+                session_utterance = min(da, db)
+
+            # デバッグ/トレース用情報を追加
+            trace.append(f"🔎 ペア: {key}, da={da}, db={db}, session_utterance={session_utterance}, total_past={total_past}, history={list(past_utterances)}")
 
             if key not in self.scores:
                 # 初回はそのまま採用
@@ -314,6 +372,14 @@ class RelationScorer:
         # ★ update_state=True のときだけ、スナップショットを現在値に更新
         if update_state:
             self._last_totals = defaultdict(int, utterance_counts)
+            # キャッシュを更新
+            self._last_logs_hash = current_logs_hash
+            self._last_scores_cache = dict(out)
 
         trace.append(f"📈 EMA後スコア: {pformat(out)}")
+        # verbose モードなら計算過程を標準出力へ出す
+        if self.verbose:
+            print("[RelationScorer] EMA trace:")
+            for line in trace:
+                print(line)
         return (out, trace) if return_trace else out  # outの例: {("A","B"): 0.3, ("A","C"): -0.1, ("B","C"): 0.0}
