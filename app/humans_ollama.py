@@ -175,7 +175,7 @@ def build_human_prompt(speaker: str, logs: List[Dict], topic: str = None, topic_
                 angry_names = "、".join(other_angry)
                 lines.append(
                     f"最初はあなた（{speaker}）も{angry_names}も全員が不機嫌な状態です。"
-                    f"全員がイライラしているため、意見の違いや些細なことで言い合いになり、お互いに攻撃的な言葉遣いで八つ当たりし合います。\n"
+                    f"全員がイライラしているため、お互いに攻撃的な言葉遣いで八つ当たりし、対立します。\n"
                 )
             elif len(who_has_same_trigger) == 2:  # 2人だけが持っている
                 # その1人に対してのみ攻撃的、もう1人には穏やか
@@ -188,18 +188,18 @@ def build_human_prompt(speaker: str, logs: List[Dict], topic: str = None, topic_
 
                 lines.append(
                     f"最初はあなた（{speaker}）も{angry_name}も不機嫌な状態です。"
-                    f"{angry_name}に対して攻撃的な言葉遣いで八つ当たりします。{calm_name}には穏やかに接します。\n"
+                    f"{angry_name}に対して攻撃的な言葉遣いで八つ当たりし、対立します。{calm_name}には穏やかに接します。\n"
                 )
             else:
                 # 自分だけが持っている地雷の場合
                 lines.append(
-                    f"最初はかなり不機嫌で、{other_names}など他の参加者に対して攻撃的な言葉遣いで文句を言ったり八つ当たりします。\n"
+                    f"最初はかなり不機嫌で、{other_names}など他の参加者に対して攻撃的な言葉遣いで文句を言ったり八つ当たりし、対立します。\n"
                 )
         else:
             # topic_triggerが指定されていない、または自分は持っていない場合
             # 案1 & 案3: 他の人を具体的に指定 + 「八つ当たり」に変更
             lines.append(
-                f"最初はかなり不機嫌で、{other_names}など他の参加者に対して攻撃的な言葉遣いで文句を言ったり八つ当たりします。\n"
+                f"最初はかなり不機嫌で、{other_names}など他の参加者に対して攻撃的な言葉遣いで文句を言ったり八つ当たりし、対立します。\n"
             )
 
     # topic_triggerが他の2人に共通していて、かつ自分は持っていない場合のみ、共通地雷のメッセージを追加
@@ -216,7 +216,7 @@ def build_human_prompt(speaker: str, logs: List[Dict], topic: str = None, topic_
 
     # 地雷がある場合のみ回復の方針を追加
     if triggers:
-        lines.append("回復の方針：一度不機嫌になって戻るためには、ロボットを含む他者の発言に納得できたときやかなり寄り添ってくれた時などに限ります。実在の人もそうですが、簡単に不機嫌でなくなることはありません。\n")
+        lines.append("回復の方針：一度不機嫌（対立状態）になって戻るためには、ロボットを含む他者が自分に対してかなり寄り添ってくれた時や、自分への発言に納得できた時などに限ります。実在の人もそうですが、簡単に不機嫌でなくなることはありません。\n")
 
     lines.extend([
         f"出力：{speaker} の次発話のみ（1–2文、自然な日本語）\n",

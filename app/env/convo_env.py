@@ -73,6 +73,7 @@ class ConversationEnv:
         time_penalty: Optional[float] = None,
         terminal_bonus: Optional[float] = None,
         intervention_cost: Optional[float] = None,
+        max_auto_skip: Optional[int] = None,
     ) -> None:
         cfg = get_config()
         use_ema_cfg = getattr(cfg.scorer, "use_ema", True)
@@ -112,24 +113,41 @@ class ConversationEnv:
         self.min_robot_intervention_lookback = int(getattr(cfg.env, "min_robot_intervention_lookback", 6))
         self.terminal_bonus_duration = int(getattr(cfg.env, "terminal_bonus_duration", 2))
 
+        # auto-skip の最大試行回数（テストから参照するためインスタンス属性として保持）
+        # コンストラクタ引数で指定されていなければ設定ファイルの値を参照し、無ければ 10 をデフォルトとする
+        self.max_auto_skip = int(max_auto_skip) if max_auto_skip is not None else int(getattr(cfg.env, "max_auto_skip", 10))
+
         # ロボット介入履歴のトラッキング
         self.steps_since_last_intervention: int = 0  # 最後の介入からのステップ数
         self.stable_step_start: Optional[int] = None  # 安定状態が開始されたステップ（Noneなら未安定）
         self.terminal_bonus_given: bool = False  # terminal_bonusが既に与えられたかどうか
 
+        # 前ステップの状態トラッキング
+        self.previous_intervened: bool = False
+        self.previous_rel_after_horizon: Optional[Dict[str, Any]] = None
+        self.previous_rel_after_bonus: Optional[Dict[str, Any]] = None
+
         # personasの処理（List形式とDict形式の両方をサポート）
         if personas is None:
             # personasが指定されていない場合は、設定から読み込む
             personas_cfg = getattr(cfg.env, "personas", None)
+            if debug:
+                print(f"[ConvoEnv.__init__] personas_cfg type: {type(personas_cfg)}")
+                print(f"[ConvoEnv.__init__] personas_cfg keys: {personas_cfg.keys() if isinstance(personas_cfg, dict) else 'N/A'}")
             if personas_cfg and isinstance(personas_cfg, dict):
                 self.persona_pool: List[str] = sorted(personas_cfg.keys())
                 self.persona_triggers: Dict[str, List[str]] = {
                     name: info.get("triggers", []) if isinstance(info, dict) else []
                     for name, info in personas_cfg.items()
                 }
+                if debug:
+                    print(f"[ConvoEnv.__init__] persona_pool: {self.persona_pool}")
+                    print(f"[ConvoEnv.__init__] persona_triggers: {self.persona_triggers}")
             else:
                 self.persona_pool: List[str] = []
                 self.persona_triggers: Dict[str, List[str]] = {}
+                if debug:
+                    print(f"[ConvoEnv.__init__] personas_cfg is None or not dict, persona_triggers set to empty")
         elif isinstance(personas, dict):
             # Dict形式: {"A": {"triggers": [...]}, "B": {...}, ...}
             self.persona_pool = sorted(personas.keys())
@@ -137,11 +155,17 @@ class ConversationEnv:
                 name: info.get("triggers", []) if isinstance(info, dict) else []
                 for name, info in personas.items()
             }
+            if debug:
+                print(f"[ConvoEnv.__init__] Dict personas provided")
+                print(f"[ConvoEnv.__init__] persona_pool: {self.persona_pool}")
+                print(f"[ConvoEnv.__init__] persona_triggers: {self.persona_triggers}")
         else:
             # List形式（後方互換性）: ["A", "B", "C"]
             persona_list = [p for p in personas if p]
             self.persona_pool = list(persona_list)
             self.persona_triggers = {}
+            if debug:
+                print(f"[ConvoEnv.__init__] List personas provided, persona_triggers set to empty")
 
         # persona_pool が初期化されたので、正確な target_human_utterances を計算
         num_personas = len(self.persona_pool) if self.persona_pool else 3
@@ -161,8 +185,10 @@ class ConversationEnv:
         self.t = 0
         self.total_steps = 0
         self.used_topics: List[str] = []  # 既に使用したトピックのリスト
+        self.used_triggers: List[str] = []  # 既に使用した地雷のリスト
         self.current_topic: Optional[str] = None  # 現在のトピック
         self.current_topic_trigger: Optional[str] = None  # 現在のトピックの元になった地雷
+        self._last_step_relations: Optional[Dict[str, Any]] = None  # 前ステップの最終関係性（evaluation_horizon後またはterminal_bonus_duration後）
 
         self._last_observation: Optional[str] = None
         self.reset()
@@ -171,6 +197,7 @@ class ConversationEnv:
         # 環境をリセットして初期状態を返す
         self.episode += 1
         self._episode_step = 0
+        self._unstable_step = 0  # 不安定なターン（訓練データになるターン）のカウント
         self.t = 0
         self.logs = []
         self.scorer = RelationScorer(**self._scorer_kwargs)
@@ -179,6 +206,12 @@ class ConversationEnv:
         self.steps_since_last_intervention = 0
         self.stable_step_start = None
         self.terminal_bonus_given = False
+        self._last_step_relations = None  # 前ステップの関係性をリセット
+
+        # 前ステップ状態のリセット
+        self.previous_intervened = False
+        self.previous_rel_after_horizon = None
+        self.previous_rel_after_bonus = None
 
         # トピックを生成
         self.current_topic = self._get_topic_suggestion()
@@ -187,10 +220,66 @@ class ConversationEnv:
         # 初期会話を生成（evaluation_horizon回のターン = 通常1ラウンド）
         self._bootstrap_humans(self.evaluation_horizon)
 
-        # _ensure_unstable_seed()をコメントアウト
-        # 初期状態が安定の場合でも追加発話を生成しないようにする
-        # 訓練時に不安定な初期状態が必要な場合は、この行を有効化してください
-        # self._ensure_unstable_seed()
+        # 安定状態の自動スキップ（初期会話でも適用）
+        # step()と同様に、安定であればmax_auto_skip回まで人間発話を生成
+        auto_skip_count = 0
+        max_auto_skip = int(getattr(self, "max_auto_skip", 10))
+
+        if self.debug:
+            print(f"  [reset auto_skip] max_auto_skip={max_auto_skip}")
+
+        while auto_skip_count < max_auto_skip:
+            # 関係性を評価
+            participants = self._participants(self.logs)
+            human_utterance_count = sum(1 for log in self.logs if log.get('speaker') != 'ロボット')
+
+            if human_utterance_count >= self.start_relation_check_after_utterances:
+                filtered_logs = filter_logs_by_human_count(self.logs, self.max_history_relation, exclude_robot=True)
+                try:
+                    scores, _ = self._relation_state(filtered_logs, update_state=True)
+                    metrics, _ = self._metrics_state(scores, participants)
+                    unstable_count = metrics.get("unstable_triads", 0)
+
+                    # 不安定なら抜ける
+                    if unstable_count > 0:
+                        if self.debug:
+                            print(f"  [reset auto_skip] 不安定になったのでループ終了 (unstable_triads={unstable_count})")
+                        break
+
+                    # 安定なら人間発話を1つ生成
+                    if self.debug:
+                        print(f"  [reset auto_skip] 安定状態を検出、人間発話を自動生成 ({auto_skip_count + 1}/{max_auto_skip})")
+
+                    replies = human_reply(self.logs, self.persona_pool, topic=self.current_topic, topic_trigger=self.current_topic_trigger, num_speakers=1)
+                    if replies:
+                        self.logs.extend(replies)
+                        auto_skip_count += 1
+                    else:
+                        if self.debug:
+                            print(f"  [reset auto_skip] 発話生成失敗、スキップ終了")
+                        break
+
+                except Exception as e:
+                    if self.debug:
+                        print(f"  [reset auto_skip] 関係性評価に失敗、スキップ終了: {e}")
+                    break
+            else:
+                # まだ3発話に達していないので抜ける
+                break
+
+        # max_auto_skip回試しても不安定にならなかった場合は話題を切り替える
+        if auto_skip_count >= max_auto_skip:
+            if self.debug:
+                print(f"  [reset auto_skip] {max_auto_skip}回試しても不安定にならず → 話題を切り替え")
+
+            # 新しい話題を生成
+            self.current_topic = self._get_topic_suggestion()
+            self.used_topics.append(self.current_topic)
+
+            # ログをクリアして新しいトピックで初期会話を生成
+            self.logs = []
+            self.scorer = RelationScorer(**self._scorer_kwargs)
+            self._bootstrap_humans(self.evaluation_horizon)
 
         observation = self._make_observation()
         self._last_observation = observation
@@ -218,94 +307,344 @@ class ConversationEnv:
             print(f"  現在のログ数: {len(self.logs)}")
             print(f"  _episode_step: {self._episode_step}")
             print(f"  steps_since_last_intervention: {self.steps_since_last_intervention}")
+            print(f"  previous_intervened: {self.previous_intervened}")
 
-        # スナップショットを保存（人間発話生成前）
-        snapshot_logs = [dict(entry) for entry in self.logs]
+        # 前ステップの介入状態に基づいて処理
+        human_replies_before = []  # このステップで生成した人間発話を保存
 
-        # 人間発話を1回生成（条件付き）
-        # - ステップ1（_episode_step == 0）: スキップ（reset()で既に生成済み）
-        # - 前ステップで介入しなかった（steps_since_last_intervention > 0）: 1発話生成
-        # - 前ステップで介入した（steps_since_last_intervention == 0）: スキップ（evaluation_horizon分が既に生成済み）
-        should_generate_human = self._episode_step > 0 and self.steps_since_last_intervention > 0
+        # 人間発話生成をスキップする条件：
+        # 1. 前のステップで介入した場合（evaluation_horizon後の発話が既に生成済み）
+        # 2. ステップ1の場合（reset()で3発話が既に生成済み）
+        skip_human_generation = self.previous_intervened or self._episode_step == 0
 
-        if should_generate_human:
-            if self.debug:
-                print(f"  👤 人間発話を1回生成中（会話を進める）...")
-
-            # 1人間発話だけを生成
+        if skip_human_generation:
+            # 前のステップの最終関係性を引き継ぐ（rel_after_bonus を優先）
+            if self.previous_intervened:
+                if self.previous_rel_after_bonus:
+                    rel_before_snapshot = self.previous_rel_after_bonus
+                    if self.debug:
+                        print(f"  使用: 前のrel_after_bonus")
+                elif self.previous_rel_after_horizon:
+                    rel_before_snapshot = self.previous_rel_after_horizon
+                    if self.debug:
+                        print(f"  使用: 前のrel_after_horizon")
+                else:
+                    rel_before_snapshot = {}
+                    if self.debug:
+                        print(f"  使用: 空のスナップショット")
+            else:
+                # ステップ1: reset()で既に発話が生成されている
+                rel_before_snapshot = self.relation_snapshot()
+                if self.debug:
+                    print(f"  ステップ1: reset()で既に{len(self.logs)}発話生成済み")
+        else:
+            # 人間1発話生成
             replies = human_reply(self.logs, self.persona_pool, topic=self.current_topic, topic_trigger=self.current_topic_trigger, num_speakers=1)
             if replies:
-                # 生成された1発話を追加
                 self.logs.extend(replies)
-
-                # 関係性を更新
-                participants = self._participants(self.logs)
-                if participants:
-                    human_utterance_count = sum(1 for log in self.logs if log.get('speaker') != 'ロボット')
-                    if human_utterance_count >= self.start_relation_check_after_utterances:
-                        filtered_logs = filter_logs_by_human_count(self.logs, self.max_history_relation, exclude_robot=True)
-                        self.scorer.get_scores(filtered_logs, participants, return_trace=False, update_state=True)
-
+                human_replies_before = replies  # 生成した人間発話を保存
                 if self.debug:
-                    print(f"  生成後のログ数: {len(self.logs)}")
-                    last_entry = self.logs[-1]
-                    print(f"  最新発話: [{last_entry.get('speaker')}] {last_entry.get('utterance', '')[:50]}...")
-        else:
+                    print(f"  生成した人間発話: {len(replies)}件")
+            # 関係性の事前スナップショット
+            rel_before_snapshot = self.relation_snapshot()
             if self.debug:
-                reason = "ステップ1（reset()で既に生成済み）" if self._episode_step == 0 else "前ステップで介入済み（evaluation_horizon分が既に生成済み）"
-                print(f"  ⏭️  人間発話生成をスキップ（{reason}）")
+                print(f"  rel_before_snapshot取得")
 
-        # 関係性を評価（人間発話生成後のログを使用）
-        participants = self._participants(self.logs)
-        human_utterance_count = sum(1 for log in self.logs if log.get('speaker') != 'ロボット')
-        if human_utterance_count >= self.start_relation_check_after_utterances:
-            filtered_logs = filter_logs_by_human_count(self.logs, self.max_history_relation, exclude_robot=True)
-            rel, trace_scores = self._relation_state(filtered_logs, update_state=True)
-        else:
-            rel = {}
-            trace_scores = []
+        # 安定状態の自動スキップ（PPO学習の効率化）
+        # filter_zero_rewards=trueの場合、安定状態では不安定になるまで人間発話を自動生成
+        skip_stable = getattr(get_config().ppo, "filter_zero_rewards", False)
+        auto_skip_count = 0
+        # インスタンス属性を使う（コンストラクタや設定で変更可能）
+        max_auto_skip = int(getattr(self, "max_auto_skip", 10))
 
-        metrics, trace_metrics = self._metrics_state(rel, participants)
-        is_stable = metrics.get("unstable_triads", 0) == 0 and bool(self.logs)
+        # skip_stableが無効の場合は、auto_skipを実行しない
+        if not skip_stable:
+            max_auto_skip = 0
+
+        # auto-skip loop: 安定状態の間、人間発話を自動生成して関係性を再評価する
+        # 不安定になるまで人間発話を生成し続け、human_replies_beforeに蓄積する
+        # ループ終了後の関係性評価結果を保存
+        final_rel_metrics = None
+        final_rel_scores = None
+
+        # ループ開始前に初期関係性を評価（previous_intervenedの場合は評価が必要）
+        if skip_stable and rel_before_snapshot.get("metrics", {}).get("unstable_triads") is None:
+            # metricsがない場合は新規評価
+            try:
+                participants = self._participants(self.logs)
+                human_utterance_count = sum(1 for log in self.logs if log.get('speaker') != 'ロボット')
+                if human_utterance_count >= self.start_relation_check_after_utterances:
+                    filtered_logs = filter_logs_by_human_count(self.logs, self.max_history_relation, exclude_robot=True)
+                    scores_init, _ = self._relation_state(filtered_logs, update_state=False)
+                    metrics_init, _ = self._metrics_state(scores_init, participants)
+                    rel_before_snapshot = {
+                        "metrics": metrics_init,
+                        "unstable_triads": metrics_init.get("unstable_triads", 0),
+                        "edges": metrics_init.get("edges", {}),
+                    }
+                    if self.debug:
+                        print(f"  [auto_skip] 初期関係性を評価: unstable_triads={metrics_init.get('unstable_triads', 0)}")
+            except Exception as e:
+                if self.debug:
+                    print(f"  [auto_skip] 初期関係性評価に失敗: {e}")
 
         if self.debug:
-            print(f"  📊 関係性評価:")
-            print(f"    不安定トライアド数: {metrics.get('unstable_triads', 0)}")
-            print(f"    安定状態: {is_stable}")
+            print(f"  [auto_skip] skip_stable={skip_stable}, max_auto_skip={max_auto_skip}")
+            print(f"  [auto_skip] 現在の関係性: unstable_triads={rel_before_snapshot.get('metrics', {}).get('unstable_triads', 'N/A')}")
 
-        # 安定な場合は報酬なしで終了
-        if is_stable:
+        while skip_stable and auto_skip_count < max_auto_skip:
+            # rel_before_snapshot は前ループでの評価結果を表す
+            current_rel = rel_before_snapshot
+            if isinstance(current_rel, dict):
+                if "metrics" in current_rel:
+                    unstable_count = current_rel["metrics"].get("unstable_triads", 0)
+                else:
+                    unstable_count = current_rel.get("unstable_triads", 0)
+            else:
+                unstable_count = 0
+
+            # 不安定なら抜ける
+            if unstable_count > 0:
+                if self.debug:
+                    print(f"  [auto_skip] 不安定になったのでループ終了 (unstable_triads={unstable_count})")
+                break
+
+            # 安定なら人間発話を1つ生成して再評価
             if self.debug:
-                print(f"  ✅ 安定状態 → 早期リターン（報酬なし）")
+                print(f"  [auto_skip] 安定状態を検出、人間発話を自動生成 ({auto_skip_count + 1}/{max_auto_skip})")
 
-            # steps_since_last_interventionを更新（介入しなかったのでインクリメント）
+            replies = human_reply(self.logs, self.persona_pool, topic=self.current_topic, topic_trigger=self.current_topic_trigger, num_speakers=1)
+            if replies:
+                # 安定時に生成された発話を self.logs に追加（実環境の会話履歴として保存）
+                self.logs.extend(replies)
+                # human_replies_before にも追加（info辞書で返すため）
+                human_replies_before.extend(replies)
+                auto_skip_count += 1
+
+                # 関係性を再評価する（update_state=True で永続的に更新）
+                try:
+                    scores_new, _ = self._relation_state(self.logs, update_state=True)
+                    metrics_new, _ = self._metrics_state(scores_new, self._participants(self.logs))
+                    rel_before_snapshot = {
+                        "metrics": metrics_new,
+                        "unstable_triads": metrics_new.get("unstable_triads", 0),
+                        "edges": metrics_new.get("edges", {}),
+                    }
+                    # ループ終了後に使うために保存
+                    final_rel_metrics = metrics_new
+                    final_rel_scores = scores_new
+
+                    if self.debug:
+                        print(f"  [auto_skip] 関係性再評価完了: unstable_triads={metrics_new.get('unstable_triads', 0)}, auto_skip_count={auto_skip_count}")
+                except Exception as e:
+                    # 万一スコアリングで失敗したらループを抜けて安全側に
+                    if self.debug:
+                        print(f"  [auto_skip] 関係性評価に失敗、スキップ終了: {e}")
+                    break
+            else:
+                # 発話生成に失敗したら抜ける
+                if self.debug:
+                    print(f"  [auto_skip] 発話生成失敗、スキップ終了")
+                break
+
+        if self.debug:
+            print(f"  [auto_skip] ループ終了: auto_skip_count={auto_skip_count}, human_replies_before={len(human_replies_before)}件")
+
+        # auto_skipループの結果を記録（デバッグ用）
+        reached_max_auto_skip = auto_skip_count >= max_auto_skip
+
+        # 介入判定
+        current_rel = rel_before_snapshot
+        # rel_before_snapshotの構造に対応: relation_snapshot()はmetricsキーあり、info["rel_after_*"]はmetricsキーなし
+        if isinstance(current_rel, dict):
+            if "metrics" in current_rel:
+                unstable_count = current_rel["metrics"].get("unstable_triads", 0)
+                edges = current_rel["metrics"].get("edges", {})
+            else:
+                unstable_count = current_rel.get("unstable_triads", 0)
+                edges = current_rel.get("edges", {})
+        else:
+            unstable_count = 0
+            edges = {}
+
+        # 関係性スコアリングが不完全な場合（edgesが空）は介入判定を行う
+        # これにより、人間発話が生成された後に必ず介入判定が行われる
+        is_relation_incomplete = (not edges) or (not current_rel)
+        should_skip_intervention_check = (unstable_count == 0) and (not is_relation_incomplete)
+
+        if self.debug:
+            print(f"  関係性評価: 不安定トライアド数: {unstable_count}, edges: {len(edges)}, 関係性不完全: {is_relation_incomplete}")
+            print(f"  介入判定スキップ: {should_skip_intervention_check}")
+
+        if should_skip_intervention_check:
+            # 安定状態 → 早期リターン（報酬なし）
+            intervened = False  # 安定状態のため介入していない
+            final_balanced = unstable_count == 0
+            final_metrics = current_rel.get("metrics", {}) if isinstance(current_rel, dict) else {}
+            reward = 0.0
+            reward_breakdown = {}
+            next_observation = self._make_observation()
+
+            # ステップカウンタを更新
             self.steps_since_last_intervention += 1
-
             self._episode_step += 1
             self.t += 1
             self.total_steps += 1
 
-            # 終了条件: 人間発話数が目標に達したか確認
-            human_utterance_count = sum(1 for log in self.logs if log.get('speaker') != 'ロボット')
-            done = human_utterance_count >= self.target_human_utterances
+            # 終了条件
+            # 1. max_auto_skip回試して不安定にならなかった場合
+            # 2. max_stepsに達した場合
+            # 3. skip_stableが有効で安定状態が続く場合（filter_zero_rewardsの意図）
+            if reached_max_auto_skip:
+                done = True
+                if self.debug:
+                    print(f"  [auto_skip] {max_auto_skip}回試しても不安定にならず → エピソード終了")
+            elif self.t >= self.max_steps:
+                done = True
+                if self.debug:
+                    print(f"  max_stepsに達したためエピソード終了 (t={self.t}, max_steps={self.max_steps})")
+            elif skip_stable and max_auto_skip > 0:
+                # filter_zero_rewardsが有効な場合、安定状態で報酬0のサンプルを避けるため終了
+                done = True
+                if self.debug:
+                    print(f"  [filter_zero_rewards] 安定状態のためエピソード終了（報酬0をスキップ）")
+            else:
+                done = False
 
-            next_observation = self._make_observation()
-            self._last_observation = next_observation
-
-            info = {
+            # info辞書
+            info: Dict[str, Any] = {
                 "plan": None,
                 "plan_error": None,
                 "intervened": False,
-                "balanced": True,
+                "balanced": final_balanced,
                 "robot_utterance": None,
-                "replies": [entry for entry in self.logs[len(snapshot_logs):]],
-                "rel": metrics,
-                "reward_breakdown": {},
+                "replies": human_replies_before,  # 生成した人間発話を追加（後方互換性のため残す）
+                "human_utterance_before_relation": human_replies_before,  # ログ順序調整用
+                "rel": final_metrics,
+                "reward_breakdown": reward_breakdown,
+                "counterfactual_u_flip": 0,
+                "actual_u_flip": 0,
+                "delta_u_flip": 0,
                 "personas": list(self.persona_pool),
+                # デバッグ用: ステップ開始時の関係性スナップショット（metricsを含む）
+                "rel_before": rel_before_snapshot.get("metrics") if isinstance(rel_before_snapshot, dict) else {},
                 "next_observation": next_observation,
             }
 
-            return next_observation, 0.0, done, info
+            # ステップ開始時の関係性状態を追加
+            # rel_before_snapshotの構造に対応
+            if isinstance(rel_before_snapshot, dict):
+                if "metrics" in rel_before_snapshot:
+                    rel_before_metrics = rel_before_snapshot["metrics"]
+                else:
+                    rel_before_metrics = rel_before_snapshot
+            else:
+                rel_before_metrics = {}
+            unstable_count_before = rel_before_metrics.get("unstable_triads", 0)
+            info["status"] = {
+                "is_stable": unstable_count_before == 0,
+                "edges": rel_before_metrics.get("edges", {}),
+            }
+
+            # 報酬の内訳が空の場合は注記
+            if not reward_breakdown:
+                info.setdefault("reward_notes", "no_breakdown_or_stable_no_reward")
+
+            # previous更新
+            self.previous_intervened = intervened
+            self.previous_rel_after_horizon = None
+            self.previous_rel_after_bonus = None
+
+            self._last_observation = next_observation
+
+            if self.debug:
+                print(f"  ✅ 安定状態 → 早期リターン（報酬なし）")
+                print(f"    最終報酬: {reward:.4f}")
+                print(f"    done: {done}")
+
+            return next_observation, reward, done, info
+
+        # スナップショットを保存（人間発話生成後、ロボット介入前）
+        snapshot_logs = [dict(entry) for entry in self.logs]
+
+        # 関係性を評価（人間発話生成後のログを使用）
+        participants = self._participants(self.logs)
+        human_utterance_count = sum(1 for log in self.logs if log.get('speaker') != 'ロボット')
+
+        # 3発話以上の場合のみ関係性評価を行い、安定判定に使用
+        if human_utterance_count >= self.start_relation_check_after_utterances:
+            # auto_skipループで既に評価済みの場合はそれを使用（再評価を避ける）
+            if final_rel_metrics is not None and final_rel_scores is not None:
+                rel = final_rel_scores
+                metrics = final_rel_metrics
+                trace_scores = []
+                trace_metrics = []
+                if self.debug:
+                    print(f"  [auto_skip] ループ内で評価した関係性を使用（再評価なし）")
+            else:
+                # ループが実行されなかった場合のみ新規評価
+                filtered_logs = filter_logs_by_human_count(self.logs, self.max_history_relation, exclude_robot=True)
+                rel, trace_scores = self._relation_state(filtered_logs, update_state=True)
+                metrics, trace_metrics = self._metrics_state(rel, participants)
+
+            is_stable = metrics.get("unstable_triads", 0) == 0 and bool(self.logs)
+
+            if self.debug:
+                print(f"  📊 関係性評価:")
+                print(f"    不安定トライアド数: {metrics.get('unstable_triads', 0)}")
+                print(f"    安定状態: {is_stable}")
+
+            # 安定な場合は報酬なしで終了
+            if is_stable:
+                if self.debug:
+                    print(f"  ✅ 安定状態 → 早期リターン（報酬なし）")
+                    print(f"    生成された人間発話: {len(human_replies_before)}件")
+                    print(f"    edges: {metrics.get('edges', {})}")
+
+                # steps_since_last_interventionを更新（介入しなかったのでインクリメント）
+                self.steps_since_last_intervention += 1
+
+                self._episode_step += 1
+                self.t += 1
+                self.total_steps += 1
+
+                # 終了条件: 安定状態ではエピソードを終了しない
+                # FiniteOnlineDataset.__iter__()でスキップされ、不安定になるまで継続
+                done = False
+
+                next_observation = self._make_observation()
+                self._last_observation = next_observation
+
+                info = {
+                    "plan": None,
+                    "plan_error": None,
+                    "intervened": False,
+                    "balanced": True,
+                    "robot_utterance": None,
+                    "replies": [entry for entry in self.logs[len(snapshot_logs):]],
+                    "human_utterance_before_relation": human_replies_before,  # ログ順序調整用
+                    "rel": metrics,
+                    "reward_breakdown": {},
+                    "personas": list(self.persona_pool),
+                    "next_observation": next_observation,
+                    "status": {
+                        "is_stable": True,
+                        "edges": metrics.get("edges", {}),
+                    },
+                }
+
+                return next_observation, 0.0, done, info
+        else:
+            # 3発話未満の場合は関係性評価をスキップし、介入判定に進む
+            rel = {}
+            trace_scores = []
+            metrics = {}
+            trace_metrics = []
+            is_stable = False
+
+            if self.debug:
+                print(f"  ⏭️  関係性評価をスキップ（人間発話数 {human_utterance_count} < {self.start_relation_check_after_utterances}）")
+                print(f"    介入判定に進みます")
 
         # 不安定な場合は介入判定
         if self.debug:
@@ -447,6 +786,7 @@ class ConversationEnv:
                 print(f"    小計: {reward:.4f}")
 
             # 安定になった場合、terminal_bonus_durationチェック
+            rel_after_bonus = None  # terminal_bonus_duration後の関係性を保存する変数
             if is_stable_after:
                 if self.debug:
                     print(f"  🎯 安定達成 → terminal_bonusチェック開始")
@@ -480,6 +820,8 @@ class ConversationEnv:
                         print(f"  🎁 安定が持続 → terminal_bonus付与: +{self.terminal_bonus:.4f}")
                     reward += self.terminal_bonus
                     reward_breakdown["terminal_bonus"] = self.terminal_bonus
+                    # terminal_bonus_duration後の関係性を保存（後でinfoに追加）
+                    rel_after_bonus = metrics_check
                 elif self.debug:
                     print(f"  ⚠️  安定が持続せず → terminal_bonusなし")
 
@@ -487,6 +829,7 @@ class ConversationEnv:
 
         # ステップカウンタを更新
         self._episode_step += 1
+        self._unstable_step += 1  # 不安定なターンをカウント
         self.t += 1
         self.total_steps += 1
 
@@ -494,8 +837,8 @@ class ConversationEnv:
         final_participants = self._participants(self.logs)
         final_human_count = sum(1 for log in self.logs if log.get('speaker') != 'ロボット')
 
-        # 終了条件: 人間発話数が目標に達したか確認
-        done = final_human_count >= self.target_human_utterances
+        # 終了条件: ステップ数がmax_stepsに達したか確認
+        done = self.t >= self.max_steps
 
         if final_human_count >= self.start_relation_check_after_utterances:
             final_filtered = filter_logs_by_human_count(self.logs, self.max_history_relation, exclude_robot=True)
@@ -523,19 +866,55 @@ class ConversationEnv:
             "balanced": final_balanced,
             "robot_utterance": robot_entry["utterance"] if robot_entry else None,
             "replies": [entry for entry in self.logs[len(snapshot_logs):]],
+            "human_utterance_before_relation": human_replies_before,  # ログ順序調整用
             "rel": final_metrics,
             "reward_breakdown": reward_breakdown,
             "counterfactual_u_flip": counterfactual_u_flip,
             "actual_u_flip": actual_u_flip,
             "delta_u_flip": delta,
             "personas": list(self.persona_pool),
+            # デバッグ用: ステップ開始時の関係性スナップショット（metricsを含む）
+            "rel_before": rel_before_snapshot.get("metrics") if isinstance(rel_before_snapshot, dict) else {},
             "next_observation": next_observation,
         }
 
+        # ステップ開始時の関係性を追加（ログ用）
+        # rel_before_snapshotの構造に対応
+        if isinstance(rel_before_snapshot, dict):
+            if "metrics" in rel_before_snapshot:
+                rel_before_metrics = rel_before_snapshot["metrics"]
+            else:
+                rel_before_metrics = rel_before_snapshot
+        else:
+            rel_before_metrics = {}
+        unstable_count_before = rel_before_metrics.get("unstable_triads", 0)
+        info["status"] = {
+            "is_stable": unstable_count_before == 0,
+            "edges": rel_before_metrics.get("edges", {}),
+        }
+
+        if self.debug:
+            print(f"[ConvoEnv.step] DEBUG - info['status']:")
+            print(f"  is_stable: {unstable_count_before == 0}")
+            print(f"  edges: {rel_before_metrics.get('edges', {})}")
+
         # 介入した場合、evaluation_horizon後の関係性を追加
-        if intervened and 'metrics_after' in locals():
+        if intervened:
             info["rel_after_horizon"] = metrics_after
             info["stable_after_horizon"] = is_stable_after
+
+            # terminal_bonus_duration後の関係性を追加（該当する場合）
+            if rel_after_bonus is not None:
+                info["rel_after_bonus"] = rel_after_bonus
+
+        # 報酬の内訳が空の場合は注記を追加（安定で報酬計算がスキップされた等の理由）
+        if not reward_breakdown:
+            info.setdefault("reward_notes", "no_breakdown_or_stable_no_reward")
+
+        # previous更新
+        self.previous_intervened = intervened
+        self.previous_rel_after_horizon = info.get("rel_after_horizon") if intervened else None
+        self.previous_rel_after_bonus = info.get("rel_after_bonus") if intervened and info.get("rel_after_bonus") else None
 
         return next_observation, reward, done, info
 
@@ -552,7 +931,7 @@ class ConversationEnv:
         system = getattr(topic_cfg, "generation_prompt", "")
 
         # persona_triggersから trigger_examples を生成
-        # ランダムに1つだけ選択
+        # ランダムに1つだけ選択（既に選択済みの地雷は除外）
         selected_trigger = None
         if self.persona_triggers and "{trigger_examples}" in system:
             # 全personaのtriggersを平坦化（重複を除く）
@@ -563,16 +942,37 @@ class ConversationEnv:
             all_triggers = list(set(all_triggers))
 
             if all_triggers:
+                # まだ選択していない地雷を取得
+                available_triggers = [t for t in all_triggers if t not in self.used_triggers]
+
+                # 全ての地雷が選択済みの場合はリセット
+                if not available_triggers:
+                    self.used_triggers = []
+                    available_triggers = all_triggers
+
                 # ランダムに1つだけ選択
-                selected_trigger = random.choice(all_triggers)
+                selected_trigger = random.choice(available_triggers)
+                self.used_triggers.append(selected_trigger)
                 trigger_examples = selected_trigger
                 system = system.replace("{trigger_examples}", trigger_examples)
+
+                if self.debug:
+                    print(f"[topic] 選択された地雷: {selected_trigger}")
+                    print(f"[topic] 地雷を持つペルソナ: {[p for p, ts in self.persona_triggers.items() if selected_trigger in ts]}")
             else:
                 # triggersが空の場合はプレースホルダーを削除
                 system = system.replace("{trigger_examples}", "様々なテーマ")
+                if self.debug:
+                    print(f"[topic] 地雷リストが空です")
+        else:
+            if self.debug:
+                print(f"[topic] persona_triggers: {bool(self.persona_triggers)}, has placeholder: {'{trigger_examples}' in system}")
 
         # 選択された地雷を保存（人間LLMで使用するため）
         self.current_topic_trigger = selected_trigger
+
+        if self.debug:
+            print(f"[topic] current_topic_trigger: {self.current_topic_trigger}")
 
         used_str = "\n".join(f"- {t}" for t in self.used_topics) if self.used_topics else "(なし)"
         prompt = f"[既に提案した話題]\n{used_str}"
@@ -644,55 +1044,15 @@ class ConversationEnv:
         time_penalty = context.get("time_penalty", self.time_penalty)
         intervention_cost = context.get("intervention_cost", self.intervention_cost)
 
+        # プロンプト最適化: 可変要素（会話履歴、関係スコア）のみを返す
+        # 固定説明（タスク、制約、戦略）はシステムプロンプトに移動済み（build_robot_messages参照）
         prompt_lines = [
-            "三者会話（話者 A/B/C）の関係を安定化するため、ロボットが適切なタイミングで一言介入します。",
-            "あなたの役割は、現在の会話履歴と各ペアの関係スコア（-1..1）を受け取り、"
-            "「できるだけ早く関係性を安定状態（+++,+--,-+-,--+）にする」ための介入方法（今介入すべきか・対象リンク・発話先・介入タイプ）を提案することです。",
-            # "介入しなくても自動的に安定状態になりそうな場合には介入しない選択をすることも有効です。"
-            "※ロボットの実際の発話文は別LLMが生成します。あなたは介入方法だけを出力します。",
-            "",
-            "制約:",
-            "- 出力は JSON のみ。説明や装飾は禁止。",
-            "- intervene_now は true|false（今すぐ介入すべきか）。",
-            "- edge_to_change は \"AB\" | \"BC\" | \"CA\" のいずれか。",
-            "- strategy は " + " | ".join(_PLANNER_STRATEGIES) + " から選択。",
-            "  - reframe: 否定的状況を肯定的視点から再解釈、認知を転換",
-            "  - validate: 対象者の感情・意見を承認し、心理的安全性を構築",
-            "  - bridge: 対立する者の共通点・目標を明示し、協力関係を構築",
-            "  ※どの戦略をいつ使うかは会話文脈や関係スコアから判断してください。",
-            "- target_speaker は A | B | C のいずれか。（その介入を誰に向けるか）",
-            "- intervene_now=true の場合は edge_to_change / strategy / target_speaker を必ず指定。",
-            "- intervene_now=false の場合は何も指定しない。",
-            "",
             "履歴:",
             *history_lines,
             "",
             "現在の関係スコア（-1..1）: " + ", ".join(f"w_{edge}={value:+.2f}" for edge, value in scores.items()),
-            # f"推定安定パターン: {stable_sign}",
-            # f"推奨リンク候補: {target_edge}",
-            # f"評価窓 H_eval: {eval_horizon}",
-            # f"時間ペナルティ α: {time_penalty:.3f}",
-            # f"介入コスト c_act: {intervention_cost:.3f}",
-            "",
-            "出力例（JSONのみ）:",
-            '{"intervene_now": true, "edge_to_change": "AB", "strategy": "reframe", "target_speaker": "A"}',
-            '{"intervene_now": false}',
         ]
         return "\n".join(prompt_lines)
-
-    def relation_snapshot(self) -> Dict[str, Any]:
-        # 現在の関係スコアとメトリクスのスナップショットを返す
-        participants = self._participants(self.logs)
-        scores = self.scorer.get_scores(self.logs, participants, return_trace=False, update_state=False)
-        metrics = analyze_relations_from_scores(scores, include_nodes=participants)
-        u_flip, stable_sign, distances = self._compute_u_flip(self._edge_weights_from_scores(scores))
-        return {
-            "scores": scores,
-            "metrics": metrics,
-            "u_flip": u_flip,
-            "stable_sign": stable_sign,
-            "distances": distances,
-        }
 
     def _parse_plan(self, action: str) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
         # 先頭・末尾の引用符や括弧を削る
@@ -1146,8 +1506,17 @@ class ConversationEnv:
             else:
                 status = "?"
             triangles[nodes] = status
-        return {
+
+        # 戻り値を構築（後方互換性のため、metricsの内容もトップレベルに含める）
+        result = {
             "participants": [p for p in participants if p != "ロボット"],
             "triangles": triangles,
             "scores": scores,
+            "metrics": relations,  # metricsキーを追加（edgesなどを含む）
+            # 後方互換性のため、metricsの主要なキーをトップレベルにも追加
+            "unstable_triads": relations.get("unstable_triads", 0),
+            "balanced_triads": relations.get("balanced_triads", 0),
+            "edges": relations.get("edges", {}),
+            "iso_nodes": relations.get("iso_nodes", 0),
         }
+        return result

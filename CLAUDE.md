@@ -56,16 +56,18 @@
 
 ### Docker構成
 
-システムは複数のDockerコンテナを使用（`docker-compose.yml`参照）:
+このリポジトリ付属の `docker-compose.yml` には主に訓練用コンテナが定義されています。現状の compose 定義では Trainer コンテナのみが含まれており、Ollama 系サービス (`ollama_a`/`ollama_b`/`ollama_c`/`ollama_d`) は含まれていません。
 
-- `trainer`: PPOモデル訓練用のメイン訓練コンテナ（GPU 0-3使用）
-- `ollama_a`, `ollama_b`, `ollama_c`: 人間ペルソナをシミュレートする3つのOllamaインスタンス（GPU 4-5使用）
-- `ollama_d`: 関係性スコアリング用のOllamaインスタンス（GPU 5使用）
+- `trainer`: PPOモデル訓練用のメイン訓練コンテナ（`container_name: rl-trainer`）
 
-環境変数:
-- `OLLAMA_BASES`: 人間ペルソナ用のOllamaエンドポイントのカンマ区切りリスト
-- `CUDA_VISIBLE_DEVICES`: 訓練用のGPU割り当て
-- `OLLAMA_SCORER_BASE`: 関係性スコアリング専用のエンドポイント
+注意:
+- Ollama インスタンスやその他の補助サービスは別途起動する必要があります（ローカルで個別起動するか、別の compose ファイル／ホストを用意してください）。
+- Ollama のエンドポイントは `app/config.local.yaml` の `ollama.bases` や環境変数 `OLLAMA_BASES` / `OLLAMA_BASE` で指定します。
+
+環境変数（利用に応じて設定）:
+- `OLLAMA_BASES` / `OLLAMA_BASE`: 人間ペルソナ用の Ollama エンドポイント一覧または単一エンドポイント
+- `OLLAMA_SCORER_BASE`: 関係性スコアリング専用の Ollama エンドポイント（優先度高）
+- `CUDA_VISIBLE_DEVICES`: 訓練用の GPU 割り当て
 
 ## よく使うコマンド
 
@@ -145,10 +147,86 @@ python app/simulate_gpt5_intervention.py --quiet
 - `llm.*`: Azure OpenAI設定（エンドポイント、APIキー、モデルデプロイメント）
 - `ollama.*`: Ollamaエンドポイント設定とモデル選択
 - `scorer.*`: 関係性スコアリングのバックエンドとパラメータ
+- `wandb.*`: Weights & Biases可視化設定
 
 **注意**: `config.local.yaml`にはAPIキーが含まれています。このファイルは絶対にコミットしないでください。
 
+### 現在の設定値（2025-11-01時点）
+
+#### 環境設定 (`env`)
+```yaml
+max_rounds: 6  # 1ラウンド = 3人間発話、6ラウンド = 18発話
+max_auto_skip: 10  # 安定状態が続いた場合の自動スキップ回数
+evaluation_horizon: 3  # ロボット介入後、N発話後の関係性を評価
+start_relation_check_after_utterances: 3  # 最初のN発話は関係性チェックをスキップ
+time_penalty: 0.02  # ステップごとのペナルティ（0.05 → 0.02に削減）
+terminal_bonus: 2.0  # 安定達成時のボーナス（1.5 → 2.0に増加）
+intervention_cost: 0.3  # ロボット介入コスト（0.45 → 0.3に削減）
+```
+
+#### 関係性スコアラー設定 (`scorer`)
+```yaml
+backend: "azure"   # 例: "azure" | "ollama" | "rule"
+use_ema: false      # EMA(指数移動平均)は現在 config で無効化されています
+decay_factor: 1.5
+```
+
+#### PPOハイパーパラメータ (`ppo`)
+```yaml
+# KL安定化
+lr: 1.0e-5  # 学習率（2e-5 → 1e-5、KL爆発防止）
+batch_size: 16  # バッチサイズ（8 → 16、統計的安定性向上）
+grad_accum_steps: 2  # 勾配累積（実効バッチサイズ16）
+kl_coef: 0.3  # KL係数（0.15 → 0.3、方策崩壊防止）
+kl_estimator: "k3"  # KL推定器（k1 → k3、分散低減）
+target_kl: 0.08  # 目標KL（0.05 → 0.08、探索の余地確保）
+num_mini_batches: 4  # ミニバッチ数（1 → 4、更新の粒度向上）
+
+# 探索促進
+temperature: 2.0  # 温度（1.5 → 2.0、探索性向上）
+top_p: 0.85  # nucleus sampling（0.90 → 0.85）
+entropy_floor: 0.02  # エントロピー閾値（0.008 → 0.02）
+entropy_patience: 10  # 早期停止の猶予（5 → 10）
+
+# 価値関数
+vf_coef: 0.05  # 価値関数係数（0.1 → 0.05、過学習防止）
+gamma: 0.9  # 割引率（1.0 → 0.9、長期報酬の割引）
+
+# 学習制御
+filter_zero_rewards: true  # 安定状態の自動スキップを有効化
+whiten_rewards: true  # 報酬の正規化
+```
+
+#### Weights & Biases設定 (`wandb`)
+```yaml
+enabled: true
+project: "rl-convo-policy"
+entity: "yoshinari0312-keio-jp"
+table_log_frequency: 30  # 30介入ごとにwandb.Tableをログ
+```
+
 ## 重要な実装の詳細
+
+### 安定状態の自動スキップ (`filter_zero_rewards`)
+
+**目的**: 報酬0のサンプル（安定状態で介入しない場合）を訓練データから除外し、学習効率を向上させる。
+
+**実装** (`app/env/convo_env.py`):
+- `reset()`: 初期会話生成後、安定状態であれば最大`max_auto_skip`回まで人間発話を生成し、不安定になるまで待つ。それでも安定なら話題を切り替えて再生成。
+- `step()`: 介入判定前に安定状態をチェック。安定であれば同様に人間発話を自動生成。`max_auto_skip`回試しても不安定にならない場合はエピソード終了。
+
+**設定**:
+```yaml
+ppo:
+  filter_zero_rewards: true  # 有効化
+env:
+  max_auto_skip: 10  # 最大自動スキップ回数
+```
+
+**効果**:
+- 訓練データの質向上（報酬シグナルが明確なサンプルのみ）
+- 学習の高速化
+- 方策崩壊のリスク低減
 
 ### 会話履歴のフィルタリング
 
@@ -181,6 +259,69 @@ PPO訓練は複数のデバイスマッピング戦略をサポート（`ppo.dev
 
 参照モデルは単一GPUに配置されます（`ppo.ref_device`で設定可能）。
 
+### Weights & Biases可視化
+
+訓練中の方策の振る舞いをリアルタイムで監視するため、wandb.Tableによる可視化を実装。
+
+**記録内容**:
+1. **戦略テーブル** (`strategy_table`):
+   - 各介入での戦略選択（validate/bridge/reframe）
+   - 対象エッジ、安定状態の変化、報酬
+
+2. **出力テーブル** (`output_table`):
+   - モデルの詳細な出力（発話内容、関係性スコア）
+   - 最新100件を保持
+
+3. **戦略分布メトリクス**:
+   - `strategy/validate_ratio`, `strategy/bridge_ratio`, `strategy/reframe_ratio`
+   - リアルタイムで方策崩壊を検出
+
+**使い方**:
+```bash
+# wandbにログイン（初回のみ）
+wandb login
+
+# 訓練実行
+python app/ppo_train.py
+
+# ダッシュボードで確認
+# https://wandb.ai/yoshinari0312-keio-jp/rl-convo-policy
+```
+
+**方策崩壊の検出**:
+- `strategy/validate_ratio > 0.8` → 方策崩壊の兆候
+- `strategy/reframe_ratio = 0` → reframe戦略が消失
+
+### バッチサマリー集計
+
+**BatchSummaryCollector** (`app/batch_summary.py`):
+- バッチごとの統計を正確に集計
+- 選択肢の分布とエントロピーを計算
+- `batch_summary.jsonl`に記録（`conversation_summary.jsonl`と分離）
+
+**記録内容**:
+```json
+{
+  "batch_summary": {
+    "batch_id": 1,
+    "batch_size": 16,
+    "total_reward": 2.5,
+    "total_interventions": 12,
+    "choice_entropy": {
+      "strategy": 1.2,  // エントロピー（bits）
+      ...
+    },
+    "choice_distributions": {
+      "strategy": {
+        "validate": 8,
+        "bridge": 5,
+        "reframe": 3
+      }
+    }
+  }
+}
+```
+
 ## ファイル構造
 
 ```
@@ -190,6 +331,7 @@ app/
 ├── config.py                      # 設定ローダー
 ├── config.local.yaml              # ローカル設定（コミットしない）
 ├── ppo_train.py                   # PPO訓練スクリプト
+├── batch_summary.py               # バッチサマリー集計モジュール
 ├── relation_scorer.py             # 関係性スコアリングモジュール
 ├── humans_ollama.py               # 人間ペルソナシミュレーション
 ├── azure_clients.py               # Azure OpenAIクライアントセットアップ
@@ -203,6 +345,16 @@ docker-compose.yml           # マルチコンテナセットアップ
 Dockerfile                  # コンテナ定義
 CHANGES_PPO_INTEGRATION.md  # PPO変更のドキュメント
 ```
+
+### ログファイル構造
+
+訓練実行ごとに`app/logs/ppo_run-YYYYMMDD-HHMMSS/`ディレクトリが作成され、以下のファイルが生成されます：
+
+- **`conversation_summary.jsonl`**: 各ステップの詳細な会話ログ（介入判定、報酬、関係性など）
+- **`batch_summary.jsonl`**: バッチごとの統計（戦略分布、エントロピー、報酬合計など）
+- **`metrics.jsonl`**: 訓練メトリクス（損失、KL、エントロピーなど）
+- **`run_events.jsonl`**: エピソード開始/終了などのイベントログ
+- **`config.json`**: 実行時の全設定のスナップショット
 
 ## 重要な動作の注意点
 
@@ -219,3 +371,52 @@ CHANGES_PPO_INTEGRATION.md  # PPO変更のドキュメント
 - **recheck_after_turnsは廃止**: 不安定な場合は常に関係性チェックと介入判定を実行します
 - **会話履歴は用途別に異なるフィルタリング**: 関係性LLMはロボット発話を除外、他のLLMは含める
 - **反実仮想シミュレーションと実世界の区別**: 報酬計算では、実際に展開された会話（actual）から関係性を計算し、もう一方の選択肢（counterfactual）はシミュレーションで評価します
+- **filter_zero_rewardsの動作**: `ppo.filter_zero_rewards=true`の場合、安定状態では自動的に人間発話を生成し、不安定になるまで待ちます。`max_auto_skip`回試しても不安定にならない場合はエピソードを終了します。
+
+## 方策崩壊の問題と対策
+
+### 問題の兆候
+
+訓練ログで以下のパターンが見られる場合、方策崩壊が発生している可能性があります：
+
+1. **戦略の偏り**: `strategy/validate_ratio > 0.8`（validate戦略に異常に偏る）
+2. **戦略の消失**: `strategy/reframe_ratio = 0`（reframe戦略が完全に消失）
+3. **連続使用**: 同じ戦略が数十回連続で選ばれる
+4. **エントロピー崩壊**: `train/policy/entropy_avg < 0.05`
+5. **KLダイバージェンス暴走**: `train/objective/kl`が0〜12の範囲で激しく変動
+
+### 原因
+
+- **バッチサイズ不足**: 統計的に不安定なKL推定
+- **温度が低すぎ**: 探索不足
+- **報酬シグナルが弱い**: 一部の戦略のみが短期的に有利に見える
+
+### 対策（実装済み）
+
+1. **KL安定化**:
+   - `batch_size: 16`（8 → 16）
+   - `kl_estimator: "k3"`（分散の低い推定器）
+   - `num_mini_batches: 4`（更新の粒度向上）
+
+2. **探索促進**:
+   - `temperature: 2.0`（1.5 → 2.0）
+   - `entropy_floor: 0.02`（0.008 → 0.02）
+   - `entropy_patience: 10`（5 → 10）
+
+3. **報酬シグナル強化**:
+   - `intervention_cost: 0.3`（0.45 → 0.3、介入のハードル低減）
+   - `terminal_bonus: 2.0`（1.5 → 2.0、成功報酬増加）
+
+### 監視方法
+
+**wandbダッシュボード**で以下を確認：
+- 戦略分布グラフ（各戦略が20-40%の範囲に分布しているか）
+- エントロピーグラフ（> 0.2を維持しているか）
+- KLグラフ（< 1.0で安定しているか）
+
+**ログファイル**で確認：
+```bash
+# 戦略分布を確認
+grep -o '"strategy": "[^"]*"' app/logs/<run>/conversation_summary.jsonl | \
+  cut -d'"' -f4 | sort | uniq -c
+```

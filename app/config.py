@@ -55,19 +55,32 @@ class TopicManagerCfg:
 @dataclass
 class EnvCfg:
     max_steps: Optional[int] = None
+    max_rounds: Optional[int] = None
     include_robot: Optional[bool] = None
     max_history: Optional[int] = None
+    max_history_human: Optional[int] = None
+    max_history_relation: Optional[int] = None
     personas: Optional[Any] = None  # List[str] または Dict[str, Dict[str, Any]]（triggers含む）
     ref_device: Optional[Any] = None
     ref_device_map: Optional[Dict[Any, Any]] = None
     debug: Optional[bool] = None
     reward_backend: Optional[str] = None
+    start_relation_check_after_utterances: Optional[int] = None
     evaluation_horizon: Optional[int] = None
     time_penalty: Optional[float] = None
     terminal_bonus: Optional[float] = None
     intervention_cost: Optional[float] = None
     min_robot_intervention_lookback: Optional[int] = None
     terminal_bonus_duration: Optional[int] = None
+    max_auto_skip: Optional[int] = None
+
+
+@dataclass
+class WandbCfg:
+    enabled: Optional[bool] = None  # wandbを使用するかどうか
+    project: Optional[str] = None  # wandbプロジェクト名
+    entity: Optional[str] = None  # wandb entity (username or team)
+    table_log_frequency: Optional[int] = None  # N回ごとにwandb.Tableをログ
 
 
 @dataclass
@@ -95,6 +108,8 @@ class PPOCfg:
     cliprange_value: Optional[float] = None
     decode_typical_p: Optional[float] = None
     decode_min_p: Optional[float] = None
+    kl_estimator: Optional[str] = None  # KL推定器: "k1" or "k3"
+    num_mini_batches: Optional[int] = None  # ミニバッチ数（更新の粒度）
 
     max_new_tokens: Optional[int] = None
     temperature: Optional[float] = None
@@ -114,6 +129,7 @@ class PPOCfg:
     entropy_floor: Optional[float] = None
     entropy_patience: Optional[int] = None
     entropy_monitor_warmup: Optional[int] = None
+    filter_zero_rewards: Optional[bool] = None
     topic_overlap_weight: Optional[float] = None
     topic_miss_penalty: Optional[float] = None
     topic_similarity_threshold: Optional[float] = None
@@ -123,6 +139,8 @@ class PPOCfg:
 
     output_dir: Optional[str] = None
     prompt_feed_debug: Optional[bool] = None
+    enable_deterministic_eval: Optional[bool] = None
+    deterministic_eval_frequency: Optional[int] = None
 
 
 # ============ ルート構成 ============
@@ -134,6 +152,7 @@ class AppConfig:
     llm: LLMCfg = field(default_factory=LLMCfg)
     ppo: PPOCfg = field(default_factory=PPOCfg)
     topic_manager: TopicManagerCfg = field(default_factory=TopicManagerCfg)
+    wandb: WandbCfg = field(default_factory=WandbCfg)
 
 
 def _filter_kwargs(cls, dct: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -231,12 +250,26 @@ def load_config(yaml_path: str = "config.local.yaml") -> AppConfig:
     # セクション毎に安全マージ
     env_dict = dict(y.get("env") or {})
 
+    # デバッグ: env_dictの内容を確認
+    if env_dict.get("debug"):
+        print(f"[config.py] env_dict keys: {env_dict.keys()}")
+        print(f"[config.py] 'personas' in env_dict: {'personas' in env_dict}")
+        if "personas" in env_dict:
+            print(f"[config.py] env_dict['personas'] type: {type(env_dict['personas'])}")
+            print(f"[config.py] env_dict['personas'] keys: {env_dict['personas'].keys() if isinstance(env_dict['personas'], dict) else 'N/A'}")
+
     # 後方互換性: トップレベルのpersonasをenv.personasにマッピング
     legacy_personas = y.get("personas")
     if legacy_personas and "personas" not in env_dict:
         env_dict["personas"] = legacy_personas
 
-    env = EnvCfg(**_filter_kwargs(EnvCfg, env_dict))
+    filtered_env_dict = _filter_kwargs(EnvCfg, env_dict)
+    if env_dict.get("debug"):
+        print(f"[config.py] After _filter_kwargs, 'personas' in filtered: {'personas' in filtered_env_dict}")
+        if "personas" in filtered_env_dict:
+            print(f"[config.py] filtered personas type: {type(filtered_env_dict['personas'])}")
+
+    env = EnvCfg(**filtered_env_dict)
     scorer = ScorerCfg(**_filter_kwargs(ScorerCfg, y.get("scorer")))
     ollama_dict = y.get("ollama") or {}
     ollama_gen = OllamaGenOpts(**_filter_kwargs(OllamaGenOpts, (ollama_dict.get("gen_options") or {})))
@@ -262,8 +295,9 @@ def load_config(yaml_path: str = "config.local.yaml") -> AppConfig:
     llm = LLMCfg(**_filter_kwargs(LLMCfg, llm_raw))
     ppo = PPOCfg(**_filter_kwargs(PPOCfg, y.get("ppo")))
     topic_manager = TopicManagerCfg(**_filter_kwargs(TopicManagerCfg, y.get("topic_manager")))
+    wandb_cfg = WandbCfg(**_filter_kwargs(WandbCfg, y.get("wandb")))
 
-    app_cfg = AppConfig(env=env, scorer=scorer, ollama=ollama, llm=llm, ppo=ppo, topic_manager=topic_manager)
+    app_cfg = AppConfig(env=env, scorer=scorer, ollama=ollama, llm=llm, ppo=ppo, topic_manager=topic_manager, wandb=wandb_cfg)
     _validate_required_fields(app_cfg)
     return app_cfg
 

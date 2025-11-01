@@ -17,6 +17,7 @@ import dataclasses
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Any, Optional
 from functools import lru_cache
+from collections import defaultdict
 import types
 import json
 import itertools
@@ -59,6 +60,15 @@ except ImportError:  # pragma: no cover - optional dependency
 from config import get_config
 from env.convo_env import ConversationEnv
 from network_metrics import BALANCED, UNBALANCED
+from batch_summary import BatchSummaryCollector
+
+# wandb for visualization (optional)
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    wandb = None
 
 
 def _patch_gpt_oss_moe_layers(model_name: str | None = None):
@@ -611,18 +621,46 @@ def _force_model_output_tuple_safe(m: torch.nn.Module):
 class TrainingRunLogger:
     """学習中の会話ログとメトリクスを JSONL で蓄積するユーティリティ。"""
 
-    def __init__(self, run_dir: Path):
+    def __init__(self, run_dir: Path, enable_wandb: bool = True):
         self.run_dir = Path(run_dir)
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self._convo_path = self.run_dir / "conversation_summary.jsonl"
         self._metrics_path = self.run_dir / "metrics.jsonl"
         self._events_path = self.run_dir / "run_events.jsonl"
-        self._llm_raw_path = self.run_dir / "llm_details.jsonl"
+        self._batch_path = self.run_dir / "batch_summary.jsonl"  # バッチ統計専用ファイル
         self._convo_fp = open(self._convo_path, "a", encoding="utf-8")
         self._metrics_fp = open(self._metrics_path, "a", encoding="utf-8")
         self._events_fp = open(self._events_path, "a", encoding="utf-8")
-        self._llm_raw_fp = open(self._llm_raw_path, "a", encoding="utf-8")
+        self._batch_fp = open(self._batch_path, "a", encoding="utf-8")  # バッチ統計ファイル
         atexit.register(self.close)
+
+        # wandb初期化
+        self.use_wandb = enable_wandb and WANDB_AVAILABLE
+        self._wandb_run = None
+        self._strategy_table_data = []  # 戦略テーブルのデータ
+        self._output_table_data = []  # モデル出力テーブルのデータ
+        self._table_log_frequency = 50  # N回ごとにwandb.logを呼ぶ
+        self._interaction_count = 0
+
+        if self.use_wandb:
+            try:
+                # wandbが既に初期化されているかチェック
+                if wandb.run is None:
+                    # プロジェクト名を設定
+                    run_name = self.run_dir.name
+                    self._wandb_run = wandb.init(
+                        project=get_config().wandb.project,
+                        entity=get_config().wandb.entity,
+                        name=run_name,
+                        dir=str(self.run_dir.parent),
+                        reinit=True,
+                    )
+                else:
+                    self._wandb_run = wandb.run
+                print(f"✓ wandb initialized: {self._wandb_run.name}")
+            except Exception as e:
+                print(f"⚠ wandb initialization failed: {e}")
+                self.use_wandb = False
 
     def _round_float(self, value: float) -> float:
         if math.isnan(value) or math.isinf(value):
@@ -645,7 +683,7 @@ class TrainingRunLogger:
             rounded = 0.0
         return rounded
 
-    def _sanitize(self, obj):
+    def _sanitize(self, obj, parent_key=None):
         if isinstance(obj, dict):
             safe = {}
             for k, v in obj.items():
@@ -655,16 +693,19 @@ class TrainingRunLogger:
                     safe_key = ",".join(str(item) for item in k)
                 else:
                     safe_key = str(k)
-                safe[safe_key] = self._sanitize(v)
+                safe[safe_key] = self._sanitize(v, parent_key=safe_key)
             return safe
         if isinstance(obj, (list, tuple, set)):
-            return [self._sanitize(v) for v in obj]
+            return [self._sanitize(v, parent_key=parent_key) for v in obj]
         if hasattr(obj, "item") and callable(getattr(obj, "item")):
             try:
-                return self._sanitize(obj.item())
+                return self._sanitize(obj.item(), parent_key=parent_key)
             except Exception:
                 pass
         if isinstance(obj, float):
+            # 学習率などの小さい値は丸めずに保持
+            if parent_key in ('lr', 'learning_rate', 'eps', 'lr_scheduler_lr'):
+                return float(obj)
             return self._round_float(obj)
         if isinstance(obj, (str, int, bool)) or obj is None:
             return obj
@@ -675,41 +716,66 @@ class TrainingRunLogger:
             **payload,
             "timestamp": payload.get("timestamp") or datetime.utcnow().isoformat(timespec="seconds") + "Z",
         }
-        fp.write(json.dumps(self._sanitize(record), ensure_ascii=False) + "\n")
+        # インデント付きで見やすく整形（1レコード=複数行）
+        fp.write(json.dumps(self._sanitize(record), ensure_ascii=False, indent=2))
+        fp.write("\n" + "="*80 + "\n")  # レコード区切り線
         fp.flush()
 
     def log_interaction(self, **payload):
         self._write_jsonl(self._convo_fp, payload)
 
-    def log_llm_response(self, **payload):
-        record = {
-            "interaction_id": payload.get("interaction_id"),
-            "episode": payload.get("episode"),
-            "turn": payload.get("turn"),
-            "draft": payload.get("draft_response"),
-            "sanitized": payload.get("sanitized_response"),
-            "fallback_used": payload.get("fallback_used", False),
-        }
-        if payload.get("state_before") is not None:
-            record["state_before"] = payload["state_before"]
-        if payload.get("history_before"):
-            record["history_before"] = payload["history_before"]
-        if payload.get("personas"):
-            record["personas"] = payload["personas"]
-        other_keys = {k: v for k, v in payload.items() if k not in {
-            "interaction_id",
-            "episode",
-            "turn",
-            "draft_response",
-            "sanitized_response",
-            "fallback_used",
-            "state_before",
-            "history_before",
-            "personas",
-        }}
-        if other_keys:
-            record["details"] = other_keys
-        self._write_jsonl(self._llm_raw_fp, record)
+        # wandb.Tableにデータを追加
+        if self.use_wandb:
+            self._interaction_count += 1
+
+            # 介入があった場合のみ記録
+            intervention = payload.get("intervention")
+            if intervention and isinstance(intervention, dict) and intervention.get("intervened"):
+                strategy = intervention.get("strategy", "unknown")
+                edge = intervention.get("edge_to_change", "unknown")
+                robot_utterance = intervention.get("robot_utterance", "")
+
+                # 関係性情報
+                relation = payload.get("relation", {})
+                is_stable_before = relation.get("is_stable", False)
+                edges_before = relation.get("edges", {})
+
+                # horizon後の関係性
+                relation_after = payload.get("relations_after_horizon", {})
+                is_stable_after = relation_after.get("is_stable", False)
+                edges_after = relation_after.get("edges", {})
+
+                # 報酬情報
+                reward_info = payload.get("reward", {})
+                total_reward = reward_info.get("total", 0.0)
+
+                # 戦略テーブルに追加
+                self._strategy_table_data.append([
+                    self._interaction_count,  # step
+                    payload.get("episode", 0),  # episode
+                    payload.get("turn", 0),  # turn
+                    strategy,  # strategy
+                    edge,  # target_edge
+                    is_stable_before,  # stable_before
+                    is_stable_after,  # stable_after
+                    total_reward,  # reward
+                ])
+
+                # 詳細な出力テーブルに追加
+                self._output_table_data.append([
+                    self._interaction_count,  # step
+                    payload.get("episode", 0),  # episode
+                    strategy,  # strategy
+                    edge,  # target_edge
+                    robot_utterance[:100],  # utterance (truncated)
+                    str(edges_before),  # edges_before
+                    str(edges_after),  # edges_after
+                    total_reward,  # reward
+                ])
+
+            # 定期的にwandб.logを呼ぶ
+            if self._interaction_count % self._table_log_frequency == 0:
+                self._flush_wandb_tables()
 
     def log_metrics(self, split: str, metrics: dict, step: int | None = None, epoch: float | None = None):
         clean = self._sanitize(metrics or {})
@@ -719,6 +785,17 @@ class TrainingRunLogger:
         if epoch is not None:
             payload["epoch"] = epoch
         self._write_jsonl(self._metrics_fp, payload)
+
+    def log_batch_summary(self, batch_summary: dict, episode: int | None = None, step: int | None = None):
+        """バッチサマリーを専用ファイルに記録"""
+        payload = {
+            "batch_summary": batch_summary,
+        }
+        if episode is not None:
+            payload["episode"] = episode
+        if step is not None:
+            payload["step"] = step
+        self._write_jsonl(self._batch_fp, payload)
 
     def log_event(self, **payload):
         event = payload.pop("event", "info")
@@ -731,21 +808,25 @@ class TrainingRunLogger:
             record["state"] = payload["state"]
 
         if event == "episode_start":
-            record["state"] = payload.get("state")
-            if payload.get("personas"):
-                record["personas"] = payload["personas"]
+            if payload.get("topic"):
+                record["topic"] = payload["topic"]
         elif event == "episode_end":
             record["reward"] = {
                 "total": payload.get("reward"),
                 "components": _extract_reward_components(payload.get("reward_breakdown")),
             }
             if payload.get("env_metrics"):
+                unstable_count = payload["env_metrics"].get("unstable_triads", 0)
                 record["env_summary"] = {
-                    "triangles_balanced": payload["env_metrics"].get("balanced_triads"),
-                    "triangles_unbalanced": payload["env_metrics"].get("unstable_triads"),
+                    "is_stable": unstable_count == 0,
                 }
+            # エピソード統計を追加
+            if "episode_total_reward" in payload:
+                record["episode_total_reward"] = payload["episode_total_reward"]
+            if "episode_intervention_count" in payload:
+                record["episode_intervention_count"] = payload["episode_intervention_count"]
 
-        other_keys = {k: v for k, v in payload.items() if k not in {"state", "personas", "reward", "reward_breakdown", "env_metrics"}}
+        other_keys = {k: v for k, v in payload.items() if k not in {"state", "personas", "reward", "reward_breakdown", "env_metrics", "episode_total_reward", "episode_intervention_count"}}
         if other_keys:
             record["details"] = other_keys
 
@@ -756,10 +837,71 @@ class TrainingRunLogger:
         with open(target, "w", encoding="utf-8") as f:
             json.dump(self._sanitize(data), f, ensure_ascii=False, indent=2)
 
+    def _flush_wandb_tables(self):
+        """wandb.Tableをログに送信"""
+        if not self.use_wandb or not self._wandb_run:
+            return
+
+        try:
+            # 戦略テーブルを作成してログ
+            if self._strategy_table_data:
+                strategy_table = wandb.Table(
+                    columns=["step", "episode", "turn", "strategy", "target_edge",
+                            "stable_before", "stable_after", "reward"],
+                    data=self._strategy_table_data
+                )
+                wandb.log({
+                    "strategy_table": strategy_table,
+                    "step": self._interaction_count,
+                })
+
+                # 戦略の分布を集計してログ
+                from collections import Counter
+                strategy_counts = Counter([row[3] for row in self._strategy_table_data])
+                total = sum(strategy_counts.values())
+                if total > 0:
+                    wandb.log({
+                        "strategy/validate_ratio": strategy_counts.get("validate", 0) / total,
+                        "strategy/bridge_ratio": strategy_counts.get("bridge", 0) / total,
+                        "strategy/reframe_ratio": strategy_counts.get("reframe", 0) / total,
+                        "strategy/validate_count": strategy_counts.get("validate", 0),
+                        "strategy/bridge_count": strategy_counts.get("bridge", 0),
+                        "strategy/reframe_count": strategy_counts.get("reframe", 0),
+                        "step": self._interaction_count,
+                    })
+
+            # 出力テーブルを作成してログ（最新の100件のみ）
+            if self._output_table_data:
+                recent_outputs = self._output_table_data[-100:]
+                output_table = wandb.Table(
+                    columns=["step", "episode", "strategy", "target_edge",
+                            "utterance", "edges_before", "edges_after", "reward"],
+                    data=recent_outputs
+                )
+                wandb.log({
+                    "output_table": output_table,
+                    "step": self._interaction_count,
+                })
+
+            print(f"✓ wandb tables logged (interaction {self._interaction_count})")
+        except Exception as e:
+            print(f"⚠ wandb table logging failed: {e}")
+
     def close(self):
+        # 最後にwandbテーブルをフラッシュ
+        if self.use_wandb:
+            self._flush_wandb_tables()
+            # wandbをfinish
+            if self._wandb_run:
+                try:
+                    self._wandb_run.finish()
+                    print("✓ wandb run finished")
+                except Exception as e:
+                    print(f"⚠ wandb finish failed: {e}")
+
         for fp in (
             getattr(self, attr, None)
-            for attr in ("_convo_fp", "_metrics_fp", "_events_fp", "_llm_raw_fp")
+            for attr in ("_convo_fp", "_metrics_fp", "_events_fp", "_batch_fp")
         ):
             if fp and not fp.closed:
                 fp.flush()
@@ -805,7 +947,37 @@ def build_robot_messages(
         except Exception:
             prompt_text = None
 
-    system_content = "あなたはロボットDの介入計画AIです。常に JSON だけを返してください。"
+    # プロンプト最適化: 固定説明をシステムプロンプトに集約
+    system_content = """あなたは関係性を安定させるロボットの介入計画を提案するAIです。
+
+三者会話（話者 A/B/C）の関係を安定化するため、ロボットが適切なタイミングで一言介入します。
+あなたの役割は、会話履歴と各ペアの関係スコア（-1..1）を受け取り、
+「できるだけ早く関係性を安定状態（+++,+--,-+-,--+）にする」ための介入方法を提案することです。
+※ロボットの実際の発話文は別LLMが生成します。あなたは介入方法だけを出力します。
+
+制約:
+- 出力は JSON のみ。説明や装飾は禁止。
+- intervene_now は true|false（今すぐ介入すべきか）。
+- edge_to_change は "AB" | "BC" | "CA" のいずれか。
+- strategy は "reframe" | "validate" | "bridge" から選択。
+  - "reframe": 否定的状況を肯定的視点から再解釈、認知を転換
+  - "validate": 対象者の感情・意見を承認し、心理的安全性を構築
+  - "bridge": 対立する者の共通点・目標を明示し、協力関係を構築
+  ※どの戦略をいつ使うかは会話文脈や関係スコアから判断してください。
+- target_speaker は "A" | "B" | "C" のいずれか。（その介入を誰に向けるか）
+
+出力例(あくまで例です。36通りの組み合わせがあります):
+{"intervene_now": true, "edge_to_change": "AB", "strategy": "validate", "target_speaker": "A"}
+{"intervene_now": true, "edge_to_change": "BC", "strategy": "bridge", "target_speaker": "B"}
+{"intervene_now": true, "edge_to_change": "CA", "strategy": "reframe", "target_speaker": "C"}
+{"intervene_now": false}
+"""
+
+    if model_name is None:
+        model_name = _default_model_name()
+    if model_name and "Qwen3" in model_name:
+        system_content = "\\no_think\n" + system_content
+
     messages = [
         {"role": "system", "content": system_content},
         {"role": "user", "content": prompt_text},
@@ -820,40 +992,100 @@ class FiniteOnlineDataset(TorchIterableDataset):
     `num_ppo_epochs=1` にしておけば、合計サンプル数＝更新回数×バッチサイズで
     ちょうど意図した回数だけ PPO 更新が走ります。
     """
-    def __init__(self, tokenizer, env, build_messages_fn, total_samples: int):
+    def __init__(self, tokenizer, env, build_messages_fn, total_samples: int, logger=None, interaction_counter=None):
         self.tokenizer = tokenizer
         self.env = env
         self.build_messages_fn = build_messages_fn
         self.total_samples = int(total_samples)
+        self.logger = logger
+        self.interaction_counter = interaction_counter
         self._epoch = 0
     # accelerate.DataLoader から呼ばれる
     def set_epoch(self, epoch: int):
         self._epoch = int(epoch)
     def __iter__(self):
-        for _ in range(self.total_samples):
-            persona_list = list(getattr(self.env, "persona_pool", getattr(self.env, "personas", [])))
-            messages = self.build_messages_fn(self.env.logs, persona_list, env=self.env)
-            if getattr(self.env, "debug_prompts", getattr(self.env, "debug", False)):
-                print("\n[ppo_train] === Prompt feed ===")
-                print(f"episode={self.env.episode}, turn={self.env.t}, total_steps={self.env.total_steps}")
-                print("[ppo_train] conversation logs (env.logs):")
-                for entry in self.env.logs:
-                    speaker = entry.get("speaker", "?")
-                    utt = entry.get("utterance", "")
-                    print(f"  [{speaker}] {utt}")
-                print("[ppo_train] chat_template user payload:")
-                try:
-                    user_payload = next((m for m in messages if m.get("role") == "user"), None)
-                    if user_payload is not None:
-                        print(user_payload.get("content", ""))
-                    else:
+        # 不安定な状態でのみプロンプトを生成し、訓練データとする
+        # 安定状態ではconvo_env内部でmax_auto_skipループが回り、エピソード終了する
+        generated = 0
+
+        while generated < self.total_samples:
+            # 現在の環境の関係性状態をチェック
+            current_rel = self.env.relation_snapshot()
+            if isinstance(current_rel, dict):
+                metrics = current_rel.get("metrics", current_rel)
+                unstable_count = metrics.get("unstable_triads", 0)
+            else:
+                unstable_count = 0
+
+            # 不安定ならプロンプトを生成
+            if unstable_count > 0:
+                # 介入判定プロンプトを生成
+                persona_list = list(getattr(self.env, "persona_pool", getattr(self.env, "personas", [])))
+                messages = self.build_messages_fn(self.env.logs, persona_list, env=self.env)
+
+                if getattr(self.env, "debug_prompts", getattr(self.env, "debug", False)):
+                    print("\n[ppo_train] === Prompt feed ===")
+                    print(f"episode={self.env.episode}, turn={self.env.t}, total_steps={self.env.total_steps}")
+                    print(f"unstable_triads={unstable_count}")
+                    # print("[ppo_train] conversation logs (env.logs):")
+                    for entry in self.env.logs:
+                        speaker = entry.get("speaker", "?")
+                        utt = entry.get("utterance", "")
+                        print(f"  [{speaker}] {utt}")
+                    print("[ppo_train] chat_template user payload:")
+                    try:
+                        user_payload = next((m for m in messages if m.get("role") == "user"), None)
+                        if user_payload is not None:
+                            print(user_payload.get("content", ""))
+                        else:
+                            print(messages)
+                    except Exception:
                         print(messages)
-                except Exception:
-                    print(messages)
-            query = self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-            yield {"query": query}
+
+                query = self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+                generated += 1
+                yield {"query": query}
+            else:
+                # 安定 → step()で人間発話を生成
+                # convo_env内部でmax_auto_skipループが回る
+                if getattr(self.env, "debug", False):
+                    print(f"[FiniteOnlineDataset] 安定状態を検出、step()を実行")
+
+                _, _, done, info = self.env.step('{"intervene_now": false}')
+
+                if done:
+                    # max_auto_skip到達でエピソード終了 → リセット
+                    if getattr(self.env, "debug", False):
+                        print(f"[FiniteOnlineDataset] エピソード終了、reset()を実行")
+
+                    # エピソード終了時のログ出力（安定状態で生成された全発話をまとめて表示）
+                    if self.logger is not None and self.interaction_counter is not None:
+                        interaction_id = next(self.interaction_counter)
+                        human_utterances = info.get("human_utterance_before_relation", [])
+                        rel_after = info.get("rel", {})
+                        log_payload = {
+                            "interaction_id": interaction_id,
+                            "episode": self.env.episode,
+                            "turn": self.env.t,
+                            "skipped": True,
+                            "reason": "stable_state_max_auto_skip_reached",
+                            "done": True,
+                        }
+                        if human_utterances:
+                            log_payload["human_utterances"] = [
+                                {"speaker": u.get("speaker"), "utterance": u.get("utterance")}
+                                for u in human_utterances
+                            ]
+                        if rel_after:
+                            log_payload["relation"] = {
+                                "is_stable": rel_after.get("unstable_triads", 0) == 0,
+                                "edges": rel_after.get("edges", {}),
+                            }
+                        self.logger.log_interaction(**log_payload)
+
+                    self.env.reset()
     def __len__(self):
         return self.total_samples
 
@@ -1465,6 +1697,15 @@ def main():
         _kl_adjust_down = 0.9
     _cliprange = max(0.0, _to_float(getattr(ppo_cfg, "cliprange", 0.2), 0.2))
     _cliprange_value = max(0.0, _to_float(getattr(ppo_cfg, "cliprange_value", 0.2), 0.2))
+    _max_grad_norm = max(0.0, _to_float(getattr(ppo_cfg, "max_grad_norm", 1.0), 1.0))
+    _whiten_rewards = bool(getattr(ppo_cfg, "whiten_rewards", False))
+    _vf_coef = max(0.0, _to_float(getattr(ppo_cfg, "vf_coef", 0.1), 0.1))
+    _gamma = max(0.0, min(1.0, _to_float(getattr(ppo_cfg, "gamma", 1.0), 1.0)))
+    _lam = max(0.0, min(1.0, _to_float(getattr(ppo_cfg, "lam", 0.95), 0.95)))
+    _kl_estimator = str(getattr(ppo_cfg, "kl_estimator", "k1")).lower()
+    if _kl_estimator not in ["k1", "k3"]:
+        _kl_estimator = "k1"
+    _num_mini_batches = _to_int(getattr(ppo_cfg, "num_mini_batches", 1), 1)
 
     # === PPOConfig（TRL 0.23 互換の安全パラメータ）====
     ppo_config = PPOConfig(
@@ -1474,13 +1715,18 @@ def main():
         gradient_accumulation_steps=max(1, _ga),
         num_ppo_epochs=_epochs,
         kl_coef=_kl,
-        kl_estimator="k1",
+        kl_estimator=_kl_estimator,            # KL推定器（"k1" or "k3"）
+        num_mini_batches=max(1, _num_mini_batches),  # ミニバッチ数（更新の粒度）
         cliprange=_cliprange,
-        vf_coef=0.1,
+        vf_coef=_vf_coef,                      # 価値関数損失の係数
         cliprange_value=_cliprange_value,
-        gamma=1.0,
-        lam=0.95,
+        gamma=_gamma,                          # 割引率
+        lam=_lam,                              # GAE lambda
+        max_grad_norm=_max_grad_norm,          # 勾配クリッピング（安定性向上）
+        whiten_rewards=_whiten_rewards,        # 報酬の正規化（平均0、標準偏差1に変換）
         ds3_gather_for_generation=True,        # ZeRO-3 を使う場合の最適化（使ってなければ無害）
+        lr_scheduler_type="constant",          # 学習率を一定に保つ（デフォルトの"linear"は0に減衰する）
+        warmup_steps=0,                        # ウォームアップなし（すぐに full lr で学習開始）
     )
     ppo_config.target_kl = _target_kl
     ppo_config.kl_adjust_up = _kl_adjust_up
@@ -1501,7 +1747,7 @@ def main():
     # 会話環境
     env = ConversationEnv(
         max_steps=cfg.env.max_steps,
-        personas=cfg.env.personas,
+        personas=None,  # 環境内部でcfg.env.personasから読み込む
         include_robot=cfg.env.include_robot,
         max_history=cfg.env.max_history,
         backend=cfg.scorer.backend,
@@ -1516,14 +1762,23 @@ def main():
 
     run_id = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
     run_log_dir = Path("./logs") / f"ppo_run-{run_id}"
-    training_logger = TrainingRunLogger(run_log_dir)
+
+    # wandb設定を読み込み
+    enable_wandb = getattr(cfg.wandb, "enabled", True) if hasattr(cfg, "wandb") else True
+    training_logger = TrainingRunLogger(run_log_dir, enable_wandb=enable_wandb)
+
+    # wandb設定をTrainingRunLoggerに反映
+    if hasattr(cfg, "wandb") and cfg.wandb:
+        if hasattr(cfg.wandb, "table_log_frequency") and cfg.wandb.table_log_frequency:
+            training_logger._table_log_frequency = int(cfg.wandb.table_log_frequency)
     training_logger.write_json("config.json", dataclasses.asdict(cfg))
     training_logger.log_event(event="run_start", run_id=run_id)
+
+    # エピソード開始時に話題を記録
     training_logger.log_event(
         event="episode_start",
         episode=env.episode,
-        state=env.planning_context(),
-        personas=list(getattr(env, "persona_pool", getattr(env, "personas", []))),
+        topic=getattr(env, "current_topic", None),
     )
     print(f"[LOG] training artifacts => {run_log_dir}")
     interaction_counter = itertools.count(start=1)
@@ -1534,13 +1789,27 @@ def main():
     # 合計ステップ数＝ total_updates * batch_size に合わせた有限データセットを作る
     total_updates = _to_int(getattr(ppo_cfg, "total_updates", 50), 50)
     total_samples = total_updates * max(1, _bs)
-    train_ds = FiniteOnlineDataset(tokenizer, env, build_robot_messages, total_samples=total_samples)
+    train_ds = FiniteOnlineDataset(
+        tokenizer, env, build_robot_messages,
+        total_samples=total_samples,
+        logger=training_logger,
+        interaction_counter=interaction_counter
+    )
     eval_samples = max(1, _bs)
-    eval_ds = FiniteOnlineDataset(tokenizer, env, build_robot_messages, total_samples=eval_samples)
+    eval_ds = FiniteOnlineDataset(
+        tokenizer, env, build_robot_messages,
+        total_samples=eval_samples,
+        logger=training_logger,
+        interaction_counter=interaction_counter
+    )
 
     # TRL 側で要求されるバッチ回数を total_updates に合わせる
     ppo_config.total_episodes = total_samples
     ppo_config.num_train_epochs = 1
+    # max_stepsを明示的に設定（学習率スケジューラーに必要）
+    # 計算: total_updates * num_ppo_epochs = トレーニングステップ数
+    ppo_config.max_steps = total_updates * _epochs
+    print(f"[PPO] max_steps set to {ppo_config.max_steps} (total_updates={total_updates} * ppo_epochs={_epochs})")
 
     # 生成ハイパパラメータ（参考：必要なら trainer 側に渡す）
     gen_kwargs = dict(
@@ -1566,9 +1835,19 @@ def main():
     entropy_patience_value = max(1, int(getattr(ppo_cfg, "entropy_patience", 1) or 1))
     entropy_monitor_warmup = max(0, int(getattr(ppo_cfg, "entropy_monitor_warmup", 0) or 0))
 
+    # バッチサイズを取得（reward_fn内で参照するため）
+    batch_size = ppo_config.batch_size
+
+    # エピソードごとの統計を追跡
+    episode_stats: Dict[int, Dict[str, Any]] = {}
+
+    # バッチサマリーコレクターを初期化
+    batch_collector = BatchSummaryCollector(batch_size=batch_size)
+
     # 報酬関数：生成テキストを環境に流し込み、Before→After のスコア差を返す
     # PPOTrainer 0.23 では `reward_model` 経由の計算が前提のため、後段で monkeypatch して利用する
     def reward_fn(samples, **kwargs):
+        nonlocal batch_collector
         rewards: List[float] = []
 
         def _extract_plan_candidate(text: str) -> str:
@@ -1585,6 +1864,17 @@ def main():
                     pass
             return candidate
 
+        def _compute_choice_entropy(counts_dict: dict) -> float:
+            """カテゴリ分布からエントロピーを計算（bits）"""
+            if not counts_dict:
+                return 0.0
+            total = sum(counts_dict.values())
+            if total == 0:
+                return 0.0
+            probs = [count / total for count in counts_dict.values()]
+            entropy = -sum(p * math.log2(p) for p in probs if p > 0)
+            return entropy
+
         for resp in samples:
             raw_resp = resp or ""
             visible_resp = _strip_think_tags(raw_resp)
@@ -1597,48 +1887,299 @@ def main():
             except Exception:
                 state_before = None
 
+            # 安定状態の場合は介入判定をスキップ（フォールバック）
+            # 注: 通常は__iter__()でスキップされるため、ここに到達するのは不安定なターンのみ
+            try:
+                current_rel = env.relation_snapshot()
+                if isinstance(current_rel, dict):
+                    metrics = current_rel.get("metrics", current_rel)
+                    is_stable_now = metrics.get("unstable_triads", 0) == 0
+                else:
+                    is_stable_now = False
+                if is_stable_now:
+                    plan_text = '{"intervene_now": false}'
+            except Exception:
+                pass  # 安定チェックに失敗したら通常通り進める
+
+            # 選択肢をバッチコレクターに記録
+            try:
+                plan_obj = json.loads(plan_text)
+                batch_collector.add_decision(plan_obj)
+            except (json.JSONDecodeError, TypeError):
+                # JSON parse失敗時はスキップ
+                pass
+
             interaction_id = next(interaction_counter)
 
-            if training_logger is not None:
-                training_logger.log_llm_response(
-                    interaction_id=interaction_id,
-                    episode=env.episode,
-                    turn=env.t,
-                    draft_response=raw_resp,
-                    sanitized_response=plan_text,
-                    history_before=history_before,
-                    personas=list(getattr(env, "persona_pool", getattr(env, "personas", []))),
-                    state_before=state_before,
-                )
-
             next_obs, reward_value, done, info = env.step(plan_text)
-            reward_details = info.get("reward_details", {}) or {}
+            reward_details = info.get("reward_breakdown", {}) or {}
             components = _extract_reward_components(reward_details)
             total_reward = float(reward_value)
             if components:
                 total_reward = sum(components.values())
 
+            # 報酬詳細を整形（reward_detailsとcomponentsの両方から情報を取得）
+            reward_breakdown_formatted = {}
+            if reward_details:
+                if "delta_u_flip" in reward_details:
+                    reward_breakdown_formatted["Δu_flip"] = reward_details["delta_u_flip"]
+                if "intervention_cost" in reward_details:
+                    reward_breakdown_formatted["介入コスト"] = reward_details["intervention_cost"]
+                if "time_penalty" in reward_details:
+                    reward_breakdown_formatted["時間ペナルティ"] = reward_details["time_penalty"]
+                if "terminal_bonus" in reward_details:
+                    reward_breakdown_formatted["終了ボーナス"] = reward_details["terminal_bonus"]
+
+            # componentsからも情報を補完（特に安定時のtime_penalty用）
+            if components and not reward_breakdown_formatted:
+                for key, value in components.items():
+                    if "time_penalty" in key.lower() or "time" in key.lower():
+                        reward_breakdown_formatted["時間ペナルティ"] = value
+                    elif "intervention" in key.lower():
+                        reward_breakdown_formatted["介入コスト"] = value
+                    elif "delta" in key.lower() or "u_flip" in key.lower():
+                        reward_breakdown_formatted["Δu_flip"] = value
+                    elif "bonus" in key.lower() or "terminal" in key.lower():
+                        reward_breakdown_formatted["終了ボーナス"] = value
+
+            # エピソード統計の追跡
+            current_episode_id = env.episode
+            if current_episode_id not in episode_stats:
+                episode_stats[current_episode_id] = {
+                    "total_reward": 0.0,
+                    "intervention_count": 0,
+                    "unstable_no_intervention_count": 0,
+                    "plan_error_count": 0,
+                }
+            episode_stats[current_episode_id]["total_reward"] += total_reward
+            if info.get("intervened"):
+                episode_stats[current_episode_id]["intervention_count"] += 1
+
+            # 不安定で介入しなかった回数をカウント
+            status = info.get("status", {})
+            is_stable_before = status.get("is_stable", False)
+            # 不安定判定（介入判定が行われたステップ）なら decision_counter を増やす
+            if not is_stable_before:
+                decision_counter += 1
+            if not is_stable_before and not info.get("intervened"):
+                episode_stats[current_episode_id]["unstable_no_intervention_count"] += 1
+
+            # plan_errorがあればカウント
+            plan_error = info.get("plan_error")
+            if plan_error:
+                episode_stats[current_episode_id]["plan_error_count"] += 1
+
+            # バッチコレクターにステップを記録
+            batch_collector.add_step(
+                reward=total_reward,
+                intervened=info.get("intervened", False),
+                is_stable_before=is_stable_before,
+                plan_error=bool(plan_error)
+            )
+
+            # 会話の流れを整理: 介入前 → 介入 → evaluation_horizon後 → bonus確認後
             log_payload: Dict[str, Any] = {
                 "interaction_id": interaction_id,
                 "episode": env.episode,
                 "turn": env.t,
-                "plan": info.get("plan"),
-                "plan_error": info.get("plan_error"),
-                "reward": {
-                    "total": total_reward,
-                    "components": components,
-                },
                 "done": bool(done),
             }
-            if reward_details:
-                log_payload.setdefault("reward_details", reward_details)
-            if info.get("balanced") is not None:
-                log_payload.setdefault("status", {}).update({"balanced": info["balanced"]})
-            if next_obs is not None:
-                log_payload.setdefault("next_observation", next_obs)
-            training_logger.log_interaction(**log_payload)
+
+            # ステップ1の場合のみepisode_info（話題・選択された地雷・地雷を持つペルソナ）を追加
+            if env.t == 1:
+                episode_info = {}
+                if hasattr(env, "current_topic") and env.current_topic:
+                    episode_info["topic"] = env.current_topic
+
+                # デバッグ: 地雷情報を確認
+                has_trigger = hasattr(env, "current_topic_trigger")
+                trigger_value = getattr(env, "current_topic_trigger", None)
+                has_persona_triggers = hasattr(env, "persona_triggers")
+                persona_triggers_value = getattr(env, "persona_triggers", None)
+
+                if getattr(env, "debug", False):
+                    print(f"[ppo_train] DEBUG - Step 1 episode_info:")
+                    print(f"  has current_topic_trigger: {has_trigger}")
+                    print(f"  current_topic_trigger value: {trigger_value}")
+                    print(f"  has persona_triggers: {has_persona_triggers}")
+                    print(f"  persona_triggers: {persona_triggers_value}")
+
+                if has_trigger and trigger_value:
+                    selected_trigger = trigger_value
+                    episode_info["selected_trigger"] = selected_trigger
+
+                    # 選択された地雷を持っているペルソナをリストアップ
+                    if has_persona_triggers and persona_triggers_value:
+                        personas_with_trigger = [
+                            persona for persona, triggers in persona_triggers_value.items()
+                            if selected_trigger in triggers
+                        ]
+                        if personas_with_trigger:
+                            episode_info["personas_with_trigger"] = personas_with_trigger
+
+                if episode_info:
+                    log_payload["episode_info"] = episode_info
+
+            # 1. ステップ1の場合は初期発話を表示、それ以外は何も表示しない
+            if env.t == 1:
+                # 初期発話（このステップ開始時まで）
+                initial_utterances = []
+                for log_entry in history_before:
+                    if log_entry.get("speaker") != "ロボット":
+                        initial_utterances.append({
+                            "speaker": log_entry.get("speaker"),
+                            "utterance": log_entry.get("utterance"),
+                        })
+                if initial_utterances:
+                    log_payload["initial_conversation"] = initial_utterances
+
+            # 2. 前のステップで介入していない場合に生成された人間発話（ステップ1は除外）
+            if env.t > 1:
+                human_utterances_before_rel = info.get("human_utterance_before_relation", [])
+
+                if human_utterances_before_rel:
+                    log_payload["human_utterances"] = [
+                        {"speaker": r.get("speaker"), "utterance": r.get("utterance")}
+                        for r in human_utterances_before_rel if r.get("speaker") != "ロボット"
+                    ]
+
+            # 3. 関係性（ステップ開始時の関係性）
+            status = info.get("status", {})
+            is_stable_before = status.get("is_stable", False)
+            edges_before = status.get("edges", {})
+            log_payload["relation"] = {
+                "is_stable": is_stable_before,
+                "edges": edges_before,
+            }
+            # edgesが空の場合はデバッグ情報を追加
+            if not edges_before:
+                log_payload["relation"]["debug_note"] = "edges_empty_at_step_start"
+
+            # 4. 介入判定と詳細（不安定時のみ出力）
+            if not is_stable_before:
+                # 不安定時は、介入の有無に関わらず介入判定結果を出力
+                plan = info.get("plan")
+
+                if info.get("intervened"):
+                    # 介入した場合
+                    intervention_info = {
+                        "intervened": True,
+                        "robot_utterance": info.get("robot_utterance"),
+                    }
+                    if plan and isinstance(plan, dict):
+                        if "strategy" in plan:
+                            intervention_info["strategy"] = plan["strategy"]
+                        if "edge_to_change" in plan:
+                            intervention_info["edge_to_change"] = plan["edge_to_change"]
+                        if "target_speaker" in plan:
+                            intervention_info["target_speaker"] = plan["target_speaker"]
+
+                    # evaluation_horizon + terminal_bonus_duration中の人間発話を抽出
+                    replies = info.get("replies", [])
+                    if replies:
+                        intervention_info["utterances_after_intervention"] = [
+                            {"speaker": r.get("speaker"), "utterance": r.get("utterance")}
+                            for r in replies if r.get("speaker") != "ロボット"
+                        ]
+
+                    log_payload["intervention"] = intervention_info
+
+                    # 5. evaluation_horizon後の関係性
+                    if info.get("rel_after_horizon"):
+                        horizon_rel = info["rel_after_horizon"]
+                        horizon_unstable = horizon_rel.get("unstable_triads", 0)
+                        horizon_stable = horizon_unstable == 0
+                        log_payload["relations_after_horizon"] = {
+                            "is_stable": horizon_stable,
+                            "edges": horizon_rel.get("edges", {}),
+                        }
+
+                        if getattr(env, "debug", False):
+                            print(f"[ppo_train] DEBUG - relations_after_horizon:")
+                            print(f"  is_stable: {horizon_stable}")
+                            print(f"  edges: {horizon_rel.get('edges', {})}")
+
+                        # 6. terminal_bonus_duration確認（該当時のみ）
+                        if horizon_stable and reward_details.get("terminal_bonus"):
+                            log_payload["bonus_check"] = {
+                                "terminal_bonus_granted": True,
+                                "duration": env.terminal_bonus_duration,
+                            }
+                            # terminal_bonus_duration後の関係性も出力
+                            if info.get("rel_after_bonus"):
+                                bonus_rel = info["rel_after_bonus"]
+                                bonus_unstable = bonus_rel.get("unstable_triads", 0)
+                                bonus_stable = bonus_unstable == 0
+                                log_payload["relations_after_bonus"] = {
+                                    "is_stable": bonus_stable,
+                                    "edges": bonus_rel.get("edges", {}),
+                                }
+
+                                if getattr(env, "debug", False):
+                                    print(f"[ppo_train] DEBUG - relations_after_bonus:")
+                                    print(f"  is_stable: {bonus_stable}")
+                                    print(f"  edges: {bonus_rel.get('edges', {})}")
+                else:
+                    # 介入しなかった場合（不安定だが介入判定でFalse）
+                    intervention_info = {
+                        "intervened": False,
+                    }
+                    # planが不正な場合でもintervene_nowを追加（デバッグ用）
+                    if plan and isinstance(plan, dict):
+                        intervention_info["intervene_now"] = plan.get("intervene_now", False)
+                    else:
+                        # planがNoneまたは不正な場合はFalseとして扱う
+                        intervention_info["intervene_now"] = False
+                        if plan is None:
+                            intervention_info["plan_error"] = "plan_is_none"
+                        elif not isinstance(plan, dict):
+                            intervention_info["plan_error"] = "plan_not_dict"
+
+                    # 前ステップ非介入時に生成された人間発話を表示
+                    replies = info.get("replies", [])
+                    if replies:
+                        human_utterances = [
+                            {"speaker": r.get("speaker"), "utterance": r.get("utterance")}
+                            for r in replies if r.get("speaker") != "ロボット"
+                        ]
+                        if human_utterances:
+                            intervention_info["human_utterances"] = human_utterances
+
+                    log_payload["intervention"] = intervention_info
+
+            # 5. 報酬
+            log_payload["reward"] = {
+                "total": total_reward,
+                "breakdown": reward_breakdown_formatted,
+            }
+
+            # エピソード終了時は統計情報を追加
+            if done:
+                stats = episode_stats.get(current_episode_id, {
+                    "total_reward": 0.0,
+                    "intervention_count": 0,
+                    "unstable_no_intervention_count": 0,
+                    "plan_error_count": 0,
+                })
+                log_payload["episode_summary"] = {
+                    "total_reward": stats["total_reward"],
+                    "total_interventions": stats["intervention_count"],
+                    "unstable_no_intervention": stats["unstable_no_intervention_count"],
+                    "plan_errors": stats["plan_error_count"],
+                }
 
             rewards.append(total_reward)
+
+            # --- バッチ判定: intervention-decision ベース ---
+            if batch_collector.is_batch_ready():
+                batch_summary = batch_collector.get_summary()
+                training_logger.log_batch_summary(
+                    batch_summary=batch_summary,
+                    episode=env.episode,
+                    step=interaction_id,
+                )
+
+            training_logger.log_interaction(**log_payload)
 
             if done:
                 current_episode = env.episode
@@ -1646,6 +2187,15 @@ def main():
                     env_metrics = env.relation_snapshot()
                 except Exception:
                     env_metrics = {}
+
+                # エピソード統計を取得
+                stats = episode_stats.get(current_episode, {
+                    "total_reward": 0.0,
+                    "intervention_count": 0,
+                    "unstable_no_intervention_count": 0,
+                    "plan_error_count": 0,
+                })
+
                 training_logger.log_event(
                     event="episode_end",
                     episode=current_episode,
@@ -1654,13 +2204,21 @@ def main():
                     reward_breakdown=reward_details,
                     personas=list(getattr(env, "persona_pool", getattr(env, "personas", []))),
                     total_steps=env.total_steps,
+                    episode_total_reward=stats["total_reward"],
+                    episode_intervention_count=stats["intervention_count"],
+                    episode_unstable_no_intervention_count=stats["unstable_no_intervention_count"],
+                    episode_plan_error_count=stats["plan_error_count"],
                 )
+
+                # 統計をクリア
+                if current_episode in episode_stats:
+                    del episode_stats[current_episode]
+
                 env.reset()
                 training_logger.log_event(
                     event="episode_start",
                     episode=env.episode,
-                    state=env.planning_context(),
-                    personas=list(getattr(env, "persona_pool", getattr(env, "personas", []))),
+                    topic=getattr(env, "current_topic", None),
                 )
         return rewards
 
@@ -1876,6 +2434,78 @@ def main():
         data_collator=ppo_collator,           # ← これが重要
     )
 
+    # 学習率スケジューラーの確認
+    if hasattr(trainer, 'lr_scheduler') and trainer.lr_scheduler is not None:
+        current_lr = trainer.lr_scheduler.get_last_lr()[0] if hasattr(trainer.lr_scheduler, 'get_last_lr') else _lr
+        print(f"[PPO] Optimizer learning rate: {current_lr}, scheduler type: {ppo_config.lr_scheduler_type}")
+    else:
+        print(f"[PPO] No lr_scheduler found, using base learning rate: {_lr}")
+
+    class KLSpikeDetectionCallback(TrainerCallback):
+        """KL爆発を検知してバッチ詳細をダンプ"""
+        def __init__(
+            self,
+            logger: TrainingRunLogger | None = None,
+            approxkl_threshold: float = 0.05,
+            objective_kl_threshold: float = 5.0,
+        ) -> None:
+            self.logger = logger
+            self.approxkl_threshold = approxkl_threshold
+            self.objective_kl_threshold = objective_kl_threshold
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if logs is None:
+                return control
+
+            approxkl = logs.get("policy/approxkl_avg")
+            objective_kl = logs.get("objective/kl")
+            step = int(getattr(state, "global_step", 0) or 0)
+
+            # スパイク検知
+            spike_detected = False
+            spike_type = None
+            spike_value = None
+
+            if approxkl is not None and approxkl > self.approxkl_threshold:
+                spike_detected = True
+                spike_type = "approxkl"
+                spike_value = approxkl
+            elif objective_kl is not None and objective_kl > self.objective_kl_threshold:
+                spike_detected = True
+                spike_type = "objective_kl"
+                spike_value = objective_kl
+
+            if spike_detected:
+                print(f"[KL SPIKE] step={step} {spike_type}={spike_value:.4f} (threshold={self.approxkl_threshold if spike_type=='approxkl' else self.objective_kl_threshold})")
+
+                # バッチ詳細をダンプ
+                spike_details = {
+                    "step": step,
+                    "spike_type": spike_type,
+                    "spike_value": spike_value,
+                    "all_metrics": logs,
+                }
+
+                # ヒストグラム情報を含める
+                if "policy/approxkl_avg" in logs:
+                    spike_details["approxkl_avg"] = logs["policy/approxkl_avg"]
+                if "policy/clipfrac_avg" in logs:
+                    spike_details["clipfrac_avg"] = logs["policy/clipfrac_avg"]
+                if "objective/rlhf_reward" in logs:
+                    spike_details["rlhf_reward"] = logs["objective/rlhf_reward"]
+
+                # ロガーに記録
+                if self.logger is not None:
+                    try:
+                        self.logger.log_event(
+                            event="kl_spike_detected",
+                            **spike_details
+                        )
+                    except Exception as e:
+                        print(f"[KL SPIKE] Failed to log: {e}")
+
+            return control
+
     class AdaptiveKLCallback(TrainerCallback):
         def __init__(
             self,
@@ -1959,6 +2589,20 @@ def main():
                 except Exception:
                     pass
             return control
+
+    # KLスパイク検知コールバック（常に有効）
+    spike_detection_callback = KLSpikeDetectionCallback(
+        logger=training_logger,
+        approxkl_threshold=0.05,
+        objective_kl_threshold=5.0,
+    )
+    trainer.add_callback(spike_detection_callback)
+    if training_logger is not None:
+        training_logger.log_event(
+            event="kl_spike_detection_enabled",
+            approxkl_threshold=0.05,
+            objective_kl_threshold=5.0,
+        )
 
     adaptive_kl_callback = None
     if _target_kl > 0.0 and _kl > 0.0:
@@ -2055,6 +2699,163 @@ def main():
                 floor=entropy_floor_value,
                 patience=entropy_patience_value,
                 warmup=entropy_monitor_warmup,
+            )
+
+    # 決定的評価コールバック
+    class DeterministicEvalCallback(TrainerCallback):
+        """定期的に決定的評価を実行し、ベストチェックポイントを保存"""
+        def __init__(
+            self,
+            model,
+            tokenizer,
+            build_messages_fn,
+            logger: TrainingRunLogger | None = None,
+            eval_frequency: int = 10,  # 何ステップごとに評価するか
+            output_dir: str = "../models/ppo_robot",
+        ) -> None:
+            self.model = model
+            self.tokenizer = tokenizer
+            self.build_messages_fn = build_messages_fn
+            self.logger = logger
+            self.eval_frequency = eval_frequency
+            self.output_dir = output_dir
+            self.best_score = float('-inf')
+            self.best_checkpoint = None
+            self._last_eval_step = -1
+
+        def on_step_end(self, args, state, control, **kwargs):
+            step = int(getattr(state, "global_step", 0) or 0)
+
+            # 評価頻度に達していない、または既に評価済みの場合はスキップ
+            if step < self.eval_frequency or step == self._last_eval_step:
+                return control
+
+            if step % self.eval_frequency != 0:
+                return control
+
+            self._last_eval_step = step
+
+            print(f"\n[EVAL] Running deterministic evaluation at step {step}...")
+
+            try:
+                from eval_deterministic import run_deterministic_eval, print_eval_results
+
+                # 評価実行
+                results = run_deterministic_eval(
+                    model=self.model,
+                    tokenizer=self.tokenizer,
+                    build_messages_fn=self.build_messages_fn,
+                    temperature=0.0,
+                    seed=42,
+                    max_steps=8,
+                )
+
+                metrics = results["metrics"]
+
+                # 結果を表示
+                print_eval_results(results)
+
+                # スコア計算（複合指標）
+                # スコア = 安定到達率 * 2.0 - 有害介入率 * 1.0 + no-op差分 * 0.5
+                score = (
+                    metrics.stable_reach_rate * 2.0
+                    - metrics.harmful_intervention_rate * 1.0
+                    + metrics.noop_baseline_diff * 0.5
+                )
+
+                print(f"[EVAL] Composite score: {score:.4f} (best: {self.best_score:.4f})")
+
+                # ログに記録
+                if self.logger is not None:
+                    try:
+                        self.logger.log_event(
+                            event="deterministic_eval",
+                            step=step,
+                            stable_reach_rate=metrics.stable_reach_rate,
+                            avg_turns_to_stable=metrics.avg_turns_to_stable,
+                            intervention_count=metrics.intervention_count,
+                            non_intervention_count=metrics.non_intervention_count,
+                            noop_baseline_diff=metrics.noop_baseline_diff,
+                            harmful_intervention_rate=metrics.harmful_intervention_rate,
+                            total_reward=metrics.total_reward,
+                            avg_reward=metrics.avg_reward,
+                            composite_score=score,
+                        )
+                    except Exception as e:
+                        print(f"[EVAL] Failed to log: {e}")
+
+                # ベストスコア更新
+                if score > self.best_score:
+                    self.best_score = score
+                    checkpoint_name = f"best_checkpoint_step{step}_score{score:.4f}"
+                    self.best_checkpoint = checkpoint_name
+
+                    print(f"[EVAL] ✓ New best score! Saving checkpoint: {checkpoint_name}")
+
+                    # チェックポイント保存
+                    checkpoint_path = Path(self.output_dir) / checkpoint_name
+                    checkpoint_path.mkdir(parents=True, exist_ok=True)
+
+                    try:
+                        # モデルを保存
+                        unwrapped_model = getattr(self.model, "pretrained_model", self.model)
+                        unwrapped_model.save_pretrained(checkpoint_path)
+                        self.tokenizer.save_pretrained(checkpoint_path)
+
+                        # メトリクスも保存
+                        metrics_path = checkpoint_path / "eval_metrics.json"
+                        with open(metrics_path, "w") as f:
+                            json.dump({
+                                "step": step,
+                                "composite_score": score,
+                                "stable_reach_rate": metrics.stable_reach_rate,
+                                "avg_turns_to_stable": metrics.avg_turns_to_stable,
+                                "intervention_count": metrics.intervention_count,
+                                "non_intervention_count": metrics.non_intervention_count,
+                                "noop_baseline_diff": metrics.noop_baseline_diff,
+                                "harmful_intervention_rate": metrics.harmful_intervention_rate,
+                                "total_reward": metrics.total_reward,
+                                "avg_reward": metrics.avg_reward,
+                            }, f, indent=2)
+
+                        print(f"[EVAL] Checkpoint saved to {checkpoint_path}")
+
+                        if self.logger is not None:
+                            self.logger.log_event(
+                                event="best_checkpoint_saved",
+                                step=step,
+                                checkpoint_name=checkpoint_name,
+                                score=score,
+                            )
+                    except Exception as e:
+                        print(f"[EVAL] Failed to save checkpoint: {e}")
+
+            except Exception as e:
+                print(f"[EVAL] Evaluation failed: {e}")
+                import traceback
+                traceback.print_exc()
+
+            return control
+
+    # 決定的評価を有効化（設定で制御）
+    enable_deterministic_eval = getattr(ppo_cfg, "enable_deterministic_eval", True)
+    eval_frequency = getattr(ppo_cfg, "deterministic_eval_frequency", 10)
+
+    if enable_deterministic_eval:
+        deterministic_eval_callback = DeterministicEvalCallback(
+            model=policy,
+            tokenizer=tokenizer,
+            build_messages_fn=build_robot_messages,
+            logger=training_logger,
+            eval_frequency=eval_frequency,
+            output_dir=getattr(ppo_cfg, "output_dir", "../models/ppo_robot"),
+        )
+        trainer.add_callback(deterministic_eval_callback)
+        print(f"[EVAL] Deterministic evaluation enabled (frequency: every {eval_frequency} steps)")
+        if training_logger is not None:
+            training_logger.log_event(
+                event="deterministic_eval_enabled",
+                frequency=eval_frequency,
             )
 
     if training_logger is not None:

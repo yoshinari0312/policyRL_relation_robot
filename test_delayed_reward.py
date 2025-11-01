@@ -21,7 +21,7 @@ cfg = load_config(config_path)
 
 # ConversationEnvをインスタンス化（YAMLからpersonasを読み込む）
 env = ConversationEnv(
-    max_steps=getattr(cfg.env, 'max_steps', 6),
+    max_steps=getattr(cfg.env, 'max_steps', 8),
     personas=cfg.env.personas,
     include_robot=getattr(cfg.env, 'include_robot', True),
     max_history=getattr(cfg.env, 'max_history', 6),
