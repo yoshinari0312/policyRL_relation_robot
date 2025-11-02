@@ -1219,6 +1219,128 @@ class DummyRewardModel(nn.Module):
     def forward(self, *args, **kwargs):  # pragma: no cover - 呼ばれない想定
         raise RuntimeError("DummyRewardModel.forward should not be called")
 
+# === カスタムPPOTrainer: エントロピーボーナスを追加 ===
+# TRL PPOTrainerのbatch_forward()メソッドをフックして
+# エントロピーボーナスを損失に追加します
+
+class PPOTrainerWithEntropyBonus(PPOTrainer):
+    """エントロピーボーナスをlossに追加するカスタムPPOTrainer"""
+    
+    def __init__(self, *args, entropy_coef: float = 0.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.custom_entropy_coef = float(entropy_coef)
+        self._step_count = 0
+        if self.custom_entropy_coef > 0:
+            print(f"[PPOTrainerWithEntropyBonus] custom_entropy_coef={self.custom_entropy_coef} enabled", flush=True)
+        else:
+            print(f"[PPOTrainerWithEntropyBonus] custom_entropy_coef={self.custom_entropy_coef} - DISABLED", flush=True)
+    
+    def batched_forward_pass(
+        self,
+        model,
+        queries,
+        responses,
+        model_inputs,
+        return_logits=False,
+        response_masks=None,
+    ):
+        """
+        元のbatched_forward_pass()を呼び出し、
+        返されたlogprobsとref_logprobsを使ってエントロピーを計算し、
+        statsに追加します
+        """
+        print(f"[ENTROPY_BONUS] batched_forward_pass called! custom_entropy_coef={self.custom_entropy_coef}", flush=True)
+        
+        # 親クラスのメソッドを呼び出し
+        result = super().batched_forward_pass(
+            model, queries, responses, model_inputs, 
+            return_logits=return_logits, response_masks=response_masks
+        )
+        
+        # resultはタプル: (all_logprobs, all_logits, all_values, all_masks)
+        # または (all_logprobs, None, all_values, all_masks)
+        all_logprobs = result[0]
+        
+        # エントロピーを計算（logprobsから）
+        # entropy = -sum(p * log(p)) ≈ -sum(exp(logp) * logp)
+        # ただし、PPOではaction空間が離散的なので、
+        # 既にlogprobsが計算されているため、より簡単な方法として：
+        # エントロピー ≈ -mean(logprobs) （これは近似）
+        # より正確には、モデルのlogitsから計算すべきですが、
+        # ここではlogprobsの負の平均を使用
+        
+        if self.custom_entropy_coef > 0:
+            import torch
+            # all_logprobsの形状: (batch_size, seq_len)
+            # マスクを適用して有効なトークンのみ使用
+            all_masks = result[3]
+            masked_logprobs = all_logprobs * all_masks
+            entropy_approx = -(masked_logprobs.sum() / all_masks.sum())
+            
+            # ステップカウント更新（最初の呼び出しを検出）
+            self._step_count += 1
+            
+            # 最初の呼び出しは必ずログ出力
+            if self._step_count == 1:
+                print(f"[ENTROPY_BONUS] *** FIRST CALL *** batched_forward_pass called, approx_entropy={entropy_approx.item():.4f}", flush=True)
+            elif self._step_count <= 10 or self._step_count % 100 == 0:
+                print(f"[ENTROPY_BONUS] Step {self._step_count}: approx_entropy={entropy_approx.item():.4f}", flush=True)
+            
+            # エントロピーをstatsに追加（後でlossに使用できるように）
+            if not hasattr(self, '_current_entropy'):
+                self._current_entropy = entropy_approx.detach()
+            else:
+                # EMAsmoothingで更新
+                self._current_entropy = 0.9 * self._current_entropy + 0.1 * entropy_approx.detach()
+        
+        return result
+    
+    def compute_rewards(
+        self,
+        scores,
+        logprobs,
+        ref_logprobs,
+        masks,
+    ):
+        """
+        元のcompute_rewards()を呼び出し、
+        エントロピーボーナスを追加します
+        """
+        print(f"[ENTROPY_BONUS] compute_rewards called! custom_entropy_coef={self.custom_entropy_coef}", flush=True)
+        
+        # 親クラスのメソッドを呼び出してKLペナルティ付きrewardsを取得
+        rewards, non_score_rewards, kl_coef = super().compute_rewards(
+            scores, logprobs, ref_logprobs, masks
+        )
+        
+        # エントロピーボーナスを追加
+        if self.custom_entropy_coef > 0 and hasattr(self, '_current_entropy'):
+            # rewards形状: (batch_size, seq_len)
+            # エントロピーボーナスを各トークンに均等に配分
+            entropy_bonus_per_token = self.custom_entropy_coef * self._current_entropy
+            rewards = rewards + entropy_bonus_per_token
+            
+            # ログ出力（最初の呼び出し時は必ず出力）
+            avg_reward_before = (rewards - entropy_bonus_per_token).mean().item()
+            avg_reward_after = rewards.mean().item()
+            
+            if not hasattr(self, '_reward_call_count'):
+                self._reward_call_count = 0
+            self._reward_call_count += 1
+            
+            if self._reward_call_count == 1:
+                print(f"[ENTROPY_BONUS] *** FIRST REWARD CALL *** "
+                      f"entropy={self._current_entropy.item():.4f}, "
+                      f"bonus={entropy_bonus_per_token.item():.4f}, "
+                      f"reward: {avg_reward_before:.4f} -> {avg_reward_after:.4f}", flush=True)
+            elif self._step_count <= 10 or self._step_count % 100 == 0:
+                print(f"[ENTROPY_BONUS] Reward #{self._reward_call_count}: "
+                      f"entropy={self._current_entropy.item():.4f}, "
+                      f"bonus={entropy_bonus_per_token.item():.4f}, "
+                      f"reward: {avg_reward_before:.4f} -> {avg_reward_after:.4f}", flush=True)
+        
+        return rewards, non_score_rewards, kl_coef
+
 def main():
     cfg = get_config()
     ppo_cfg = cfg.ppo
@@ -2564,69 +2686,6 @@ def main():
 
     trl_ppo_trainer.get_reward = _env_get_reward
 
-    # === カスタムPPOTrainer: エントロピーボーナスを追加 ===
-    class PPOTrainerWithEntropyBonus(PPOTrainer):
-        """エントロピーボーナスをlossに追加するカスタムPPOTrainer"""
-        
-        def __init__(self, *args, entropy_coef: float = 0.0, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.entropy_coef = float(entropy_coef)
-            if self.entropy_coef > 0:
-                print(f"[PPOTrainerWithEntropyBonus] entropy_coef={self.entropy_coef} enabled")
-        
-        def compute_loss(
-            self,
-            model,
-            inputs,
-            return_outputs=False,
-        ):
-            """オリジナルのlossにエントロピーボーナスを追加"""
-            # 親クラスのcompute_lossを呼び出し
-            if return_outputs:
-                loss, outputs = super().compute_loss(model, inputs, return_outputs=True)
-            else:
-                loss = super().compute_loss(model, inputs, return_outputs=False)
-                outputs = None
-            
-            # エントロピーボーナスを追加
-            if self.entropy_coef > 0 and hasattr(self, 'state') and hasattr(self.state, 'log_history'):
-                # 最新のログからエントロピーを取得
-                for log_entry in reversed(self.state.log_history):
-                    if 'policy/entropy_avg' in log_entry:
-                        entropy_avg = float(log_entry['policy/entropy_avg'])
-                        # エントロピーボーナス（エントロピーが高いほど損失を減らす）
-                        entropy_bonus = -self.entropy_coef * entropy_avg
-                        original_loss = loss.item() if hasattr(loss, 'item') else float(loss)
-                        new_loss_value = original_loss + entropy_bonus
-                        
-                        # ターミナルにログ出力
-                        print(f"[ENTROPY_BONUS] entropy_avg={entropy_avg:.4f}, bonus={entropy_bonus:.4f}, loss: {original_loss:.4f} -> {new_loss_value:.4f}")
-                        
-                        # wandb/metricsにログ（Trainerのログ機構を使用）
-                        try:
-                            self.log({
-                                "train/loss/total_with_entropy": new_loss_value,
-                                "train/loss/total_before_entropy": original_loss,
-                                "train/loss/entropy_bonus_applied": entropy_bonus,
-                            })
-                        except Exception as e:
-                            print(f"[ENTROPY_BONUS] Failed to log metrics: {e}")
-                        
-                        # エントロピーボーナスを適用
-                        loss = loss + entropy_bonus
-                        break
-                else:
-                    if self.state.global_step % 10 == 0:  # 頻繁すぎるログを避ける
-                        print(f"[ENTROPY_BONUS] No entropy_avg in log_history (step={self.state.global_step})")
-            else:
-                if not hasattr(self, '_logged_disabled'):
-                    print(f"[ENTROPY_BONUS] Disabled: coef={self.entropy_coef}, has_state={hasattr(self, 'state')}, has_log_history={hasattr(self.state, 'log_history') if hasattr(self, 'state') else False}")
-                    self._logged_disabled = True
-            
-            if return_outputs:
-                return loss, outputs
-            return loss
-
     # TRL 0.23: train() が data["input_ids"] を参照するため
     # collator でトークナイズして渡す
     def ppo_collator(features):
@@ -2673,6 +2732,13 @@ def main():
         data_collator=ppo_collator,           # ← これが重要
         entropy_coef=_entropy_coef,           # カスタムパラメータ
     )
+    
+    # デバッグ: Trainer初期化後の状態確認
+    print(f"[TRAINER_DEBUG] Trainer initialized", flush=True)
+    print(f"[TRAINER_DEBUG] custom_entropy_coef={trainer.custom_entropy_coef}", flush=True)
+    print(f"[TRAINER_DEBUG] has state: {hasattr(trainer, 'state')}", flush=True)
+    print(f"[TRAINER_DEBUG] training_logger available: {training_logger is not None}", flush=True)
+    print(f"[TRAINER_DEBUG] training_logger type: {type(training_logger)}", flush=True)
 
     # 学習率スケジューラーの確認
     if hasattr(trainer, 'lr_scheduler') and trainer.lr_scheduler is not None:
@@ -3154,7 +3220,15 @@ def main():
     # ちょうど total_updates 回の PPO 更新にしたいので、上で total_samples を調整済み。
     run_status = "completed"
     try:
+        print(f"[TRAIN_DEBUG] Starting trainer.train()...", flush=True)
+        print(f"[TRAIN_DEBUG] Trainer class: {type(trainer).__name__}", flush=True)
+        print(f"[TRAIN_DEBUG] Has compute_loss: {hasattr(trainer, 'compute_loss')}", flush=True)
+        print(f"[TRAIN_DEBUG] compute_loss method: {trainer.compute_loss}", flush=True)
+        
         trainer.train()
+        
+        print(f"[TRAIN_DEBUG] trainer.train() completed", flush=True)
+        print(f"[TRAIN_DEBUG] compute_loss was called {trainer._compute_loss_call_count} times", flush=True)
         final_dir = model_run_dir / "final"
         final_dir.mkdir(parents=True, exist_ok=True)
         trainer.save_model(str(final_dir))

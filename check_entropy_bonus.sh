@@ -15,7 +15,27 @@ fi
 echo "📁 ログディレクトリ: $LATEST_LOG"
 echo ""
 
-# Dockerコンテナのログからエントロピーボーナス情報を確認
+# Dockerコンテナのログから全てのデバッグ情報を確認
+echo "--- Dockerログ（初期化）---"
+docker logs rl-convo-policy-app-1 2>&1 | grep "\[PPOTrainerWithEntropyBonus\]" | tail -5
+echo ""
+
+echo "--- Dockerログ（Trainer初期化後）---"
+docker logs rl-convo-policy-app-1 2>&1 | grep "\[TRAINER_DEBUG\]" | tail -10
+echo ""
+
+echo "--- Dockerログ（学習開始）---"
+docker logs rl-convo-policy-app-1 2>&1 | grep "\[TRAIN_DEBUG\]" | tail -10
+echo ""
+
+echo "--- Dockerログ（compute_loss呼び出し）---"
+docker logs rl-convo-policy-app-1 2>&1 | grep "\[COMPUTE_LOSS_DEBUG\]" | tail -15
+echo ""
+
+echo "--- Dockerログ（エントロピーデバッグ）---"
+docker logs rl-convo-policy-app-1 2>&1 | grep "\[ENTROPY_DEBUG\]" | tail -20
+echo ""
+
 echo "--- Dockerログ（エントロピーボーナス）---"
 docker logs rl-convo-policy-app-1 2>&1 | grep "\[ENTROPY_BONUS\]" | tail -10
 echo ""
@@ -24,24 +44,18 @@ echo ""
 echo "--- metrics.jsonl (train/loss/total_with_entropy) ---"
 if [ -f "$LATEST_LOG/metrics.jsonl" ]; then
     grep "train/loss/total_with_entropy" "$LATEST_LOG/metrics.jsonl" | tail -5
+    if [ $? -ne 0 ]; then
+        echo "❌ train/loss/total_with_entropy が見つかりません"
+    fi
 else
     echo "❌ metrics.jsonl が見つかりません"
 fi
 echo ""
 
-# wandbの状態を確認
-echo "--- wandb 設定 ---"
-grep -A 3 "^wandb:" app/config.local.yaml
-echo ""
-
-echo "=== 確認項目 ==="
-echo "1. [ENTROPY_BONUS] ログが出力されているか"
-echo "2. entropy_avg が 0.5 以上か（理想的な探索）"
-echo "3. train/loss/total_with_entropy がメトリクスに記録されているか"
-echo ""
-echo "=== entropy_coef 調整の目安 ==="
-echo "- entropy_avg < 0.3 → entropy_coef を 0.1 に増やす"
-echo "- 0.3 ≤ entropy_avg < 0.5 → entropy_coef を 0.07 に増やす"
-echo "- 0.5 ≤ entropy_avg < 1.0 → 現状維持（0.05）"
-echo "- entropy_avg ≥ 1.0 → entropy_coef を 0.03 に減らす"
-echo "- KL divergence > 0.3 → entropy_coef を減らす"
+echo "=== トラブルシューティング ==="
+echo "1. [PPOTrainerWithEntropyBonus] が出ているか → Trainerが初期化されている"
+echo "2. [TRAINER_DEBUG] が出ているか → Trainer初期化後の状態"
+echo "3. [TRAIN_DEBUG] が出ているか → trainer.train() が呼ばれている"
+echo "4. [COMPUTE_LOSS_DEBUG] が出ているか → compute_loss() が呼ばれている"
+echo "5. [ENTROPY_DEBUG] が出ているか → log_historyの中身を確認できる"
+echo "6. [ENTROPY_BONUS] が出ているか → エントロピーボーナスが適用されている"
