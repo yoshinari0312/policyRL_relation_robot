@@ -392,6 +392,87 @@ def _extract_reward_components(breakdown: Dict[str, Any] | None) -> Dict[str, fl
     return components
 
 
+def _validate_plan_json(text: str) -> tuple[dict | None, bool]:
+    """
+    介入判定JSONの妥当性をチェック
+
+    Args:
+        text: 検証対象のテキスト
+
+    Returns:
+        (parsed_plan_dict, is_valid): パースされた辞書とバリデーション結果
+    """
+    if not text or not isinstance(text, str):
+        return None, False
+
+    text = text.strip()
+    if not text:
+        return None, False
+
+    # JSONパース試行
+    try:
+        # JSONっぽい部分を抜き出す（既存ロジック）
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            snippet = text[start : end + 1]
+            try:
+                parsed_obj = json.loads(snippet)
+            except json.JSONDecodeError:
+                parsed_obj = json.loads(text)
+        else:
+            parsed_obj = json.loads(text)
+    except json.JSONDecodeError:
+        return None, False
+
+    # 辞書型かチェック
+    if not isinstance(parsed_obj, dict):
+        return None, False
+
+    # 必須フィールドのチェック
+    required_fields = ["intervene_now"]
+    for field in required_fields:
+        if field not in parsed_obj:
+            return None, False
+
+    # intervene_nowがtrueの場合、追加フィールドが必要
+    intervene_now = parsed_obj.get("intervene_now")
+    if intervene_now:
+        additional_required = ["strategy", "edge_to_change", "target_speaker"]
+        for field in additional_required:
+            if field not in parsed_obj:
+                return None, False
+
+        # 値の妥当性チェック
+        strategy = parsed_obj.get("strategy")
+        if strategy not in ["reframe", "validate", "bridge"]:
+            return None, False
+
+        edge_to_change = str(parsed_obj.get("edge_to_change", "")).upper()
+        if edge_to_change not in ["AB", "BC", "CA"]:
+            return None, False
+
+        target_speaker = str(parsed_obj.get("target_speaker", "")).upper()
+        if target_speaker not in ["A", "B", "C"]:
+            return None, False
+
+        # edge_to_changeとtarget_speakerの整合性チェック
+        valid_targets = {
+            "AB": ["A", "B"],
+            "BC": ["B", "C"],
+            "CA": ["C", "A"]
+        }
+
+        if edge_to_change in valid_targets:
+            if target_speaker not in valid_targets[edge_to_change]:
+                # デバッグ用: 不整合の詳細をログ出力
+                if hasattr(get_config(), 'env') and getattr(get_config().env, 'debug', False):
+                    print(f"[JSON validation] 不整合検出: edge_to_change='{edge_to_change}' target_speaker='{target_speaker}' (期待値: {valid_targets[edge_to_change]})")
+                return None, False
+
+    return parsed_obj, True
+
+
 def _format_triangle_summary(rel: Dict[str, Any] | None) -> str:
     """`analyze_relations_from_scores` の結果から三角形状態や孤立ノードを短い文字列に整形する。"""
 
@@ -638,9 +719,12 @@ class TrainingRunLogger:
         self.use_wandb = enable_wandb and WANDB_AVAILABLE
         self._wandb_run = None
         self._strategy_table_data = []  # 戦略テーブルのデータ
-        self._output_table_data = []  # モデル出力テーブルのデータ
         self._table_log_frequency = 50  # N回ごとにwandb.logを呼ぶ
         self._interaction_count = 0
+
+        # Rolling window for intervention rate tracking
+        self._intervention_window = []  # 介入判定の履歴 (True/False)
+        self._window_size = 50  # 直近50回の決定で介入率を計算
 
         if self.use_wandb:
             try:
@@ -728,52 +812,84 @@ class TrainingRunLogger:
         if self.use_wandb:
             self._interaction_count += 1
 
-            # 介入があった場合のみ記録
+            # 介入判定があった場合は常に記録（介入する・しないの両方）
             intervention = payload.get("intervention")
-            if intervention and isinstance(intervention, dict) and intervention.get("intervened"):
-                strategy = intervention.get("strategy", "unknown")
-                edge = intervention.get("edge_to_change", "unknown")
-                robot_utterance = intervention.get("robot_utterance", "")
+            if intervention and isinstance(intervention, dict):
+                # 介入した場合
+                if intervention.get("intervened"):
+                    strategy = intervention.get("strategy", "unknown")
+                    edge = intervention.get("edge_to_change", "unknown")
+                    robot_utterance = intervention.get("robot_utterance", "")
+                    target_speaker = intervention.get("target_speaker", "")
+                    decision_type = "intervention"
+                else:
+                    # 介入しなかった場合
+                    strategy = "no_intervention"
+                    edge = "none"
+                    robot_utterance = ""
+                    target_speaker = ""
+                    decision_type = "no_intervention"
 
                 # 関係性情報
                 relation = payload.get("relation", {})
                 is_stable_before = relation.get("is_stable", False)
                 edges_before = relation.get("edges", {})
 
-                # horizon後の関係性
-                relation_after = payload.get("relations_after_horizon", {})
-                is_stable_after = relation_after.get("is_stable", False)
-                edges_after = relation_after.get("edges", {})
+                # horizon後の関係性（介入した場合のみ）
+                if intervention.get("intervened"):
+                    relation_after = payload.get("relations_after_horizon", {})
+                    is_stable_after = relation_after.get("is_stable", False)
+                    edges_after = relation_after.get("edges", {})
+                else:
+                    # 介入しなかった場合は関係性変化なし
+                    is_stable_after = is_stable_before
+                    edges_after = edges_before
 
                 # 報酬情報
                 reward_info = payload.get("reward", {})
                 total_reward = reward_info.get("total", 0.0)
 
-                # 戦略テーブルに追加
+                # 戦略テーブルに追加（target_speakerとutteranceを追加）
                 self._strategy_table_data.append([
                     self._interaction_count,  # step
                     payload.get("episode", 0),  # episode
                     payload.get("turn", 0),  # turn
                     strategy,  # strategy
                     edge,  # target_edge
+                    target_speaker,  # target_speaker
+                    robot_utterance[:200] if robot_utterance else "",  # utterance (truncated)
                     is_stable_before,  # stable_before
                     is_stable_after,  # stable_after
                     total_reward,  # reward
+                    decision_type,  # intervention_type (intervention/no_intervention)
                 ])
 
-                # 詳細な出力テーブルに追加
-                self._output_table_data.append([
-                    self._interaction_count,  # step
-                    payload.get("episode", 0),  # episode
-                    strategy,  # strategy
-                    edge,  # target_edge
-                    robot_utterance[:100],  # utterance (truncated)
-                    str(edges_before),  # edges_before
-                    str(edges_after),  # edges_after
-                    total_reward,  # reward
-                ])
+                # Rolling window介入率の更新
+                intervened = intervention.get("intervened", False)
+                self._intervention_window.append(intervened)
 
-            # 定期的にwandб.logを呼ぶ
+                # Window sizeを超えた場合は古いデータを削除
+                if len(self._intervention_window) > self._window_size:
+                    self._intervention_window.pop(0)
+
+                # リアルタイム介入率を計算してログ
+                if len(self._intervention_window) >= 5:  # 最低5回の判定があった場合
+                    window_intervention_rate = sum(self._intervention_window) / len(self._intervention_window)
+
+                    # 個別interactionごとにwandبログ
+                    if self._wandb_run:
+                        try:
+                            wandb.log({
+                                "intervention/rolling_rate": window_intervention_rate,
+                                "intervention/rolling_window_size": len(self._intervention_window),
+                                "intervention/current_decision": "intervention" if intervened else "no_intervention",
+                                "step": self._interaction_count,
+                            })
+                        except Exception as e:
+                            if getattr(env, "debug", False):
+                                print(f"[wandb] rolling rate log failed: {e}")
+
+            # 定期的にwandب.logを呼ぶ
             if self._interaction_count % self._table_log_frequency == 0:
                 self._flush_wandb_tables()
 
@@ -846,42 +962,54 @@ class TrainingRunLogger:
             # 戦略テーブルを作成してログ
             if self._strategy_table_data:
                 strategy_table = wandb.Table(
-                    columns=["step", "episode", "turn", "strategy", "target_edge",
-                            "stable_before", "stable_after", "reward"],
+                    columns=["step", "episode", "turn", "strategy", "target_edge", "target_speaker",
+                            "utterance", "stable_before", "stable_after", "reward", "decision_type"],
                     data=self._strategy_table_data
                 )
-                wandb.log({
-                    "strategy_table": strategy_table,
-                    "step": self._interaction_count,
-                })
+                try:
+                    wandb.log({
+                        "strategy_table": strategy_table,
+                        "step": self._interaction_count,
+                    })
+                except Exception as log_error:
+                    print(f"⚠ wandb strategy table log failed: {log_error}")
 
                 # 戦略の分布を集計してログ
                 from collections import Counter
                 strategy_counts = Counter([row[3] for row in self._strategy_table_data])
+                decision_counts = Counter([row[10] for row in self._strategy_table_data])  # decision_type列
                 total = sum(strategy_counts.values())
-                if total > 0:
-                    wandb.log({
-                        "strategy/validate_ratio": strategy_counts.get("validate", 0) / total,
-                        "strategy/bridge_ratio": strategy_counts.get("bridge", 0) / total,
-                        "strategy/reframe_ratio": strategy_counts.get("reframe", 0) / total,
-                        "strategy/validate_count": strategy_counts.get("validate", 0),
-                        "strategy/bridge_count": strategy_counts.get("bridge", 0),
-                        "strategy/reframe_count": strategy_counts.get("reframe", 0),
-                        "step": self._interaction_count,
-                    })
 
-            # 出力テーブルを作成してログ（最新の100件のみ）
-            if self._output_table_data:
-                recent_outputs = self._output_table_data[-100:]
-                output_table = wandb.Table(
-                    columns=["step", "episode", "strategy", "target_edge",
-                            "utterance", "edges_before", "edges_after", "reward"],
-                    data=recent_outputs
-                )
-                wandb.log({
-                    "output_table": output_table,
-                    "step": self._interaction_count,
-                })
+                if total > 0:
+                    # 介入率の計算
+                    intervention_count = decision_counts.get("intervention", 0)
+                    no_intervention_count = decision_counts.get("no_intervention", 0)
+                    intervention_rate = intervention_count / total if total > 0 else 0.0
+
+                    try:
+                        wandb.log({
+                            # 戦略分布（介入した場合のみ）
+                            "strategy/validate_ratio": strategy_counts.get("validate", 0) / total,
+                            "strategy/bridge_ratio": strategy_counts.get("bridge", 0) / total,
+                            "strategy/reframe_ratio": strategy_counts.get("reframe", 0) / total,
+                            "strategy/no_intervention_ratio": strategy_counts.get("no_intervention", 0) / total,
+
+                            # 戦略カウント
+                            "strategy/validate_count": strategy_counts.get("validate", 0),
+                            "strategy/bridge_count": strategy_counts.get("bridge", 0),
+                            "strategy/reframe_count": strategy_counts.get("reframe", 0),
+                            "strategy/no_intervention_count": strategy_counts.get("no_intervention", 0),
+
+                            # 介入率メトリクス
+                            "intervention/rate": intervention_rate,
+                            "intervention/count": intervention_count,
+                            "intervention/no_intervention_count": no_intervention_count,
+                            "intervention/total_decisions": total,
+
+                            "step": self._interaction_count,
+                        })
+                    except Exception as log_error:
+                        print(f"⚠ wandb strategy metrics log failed: {log_error}")
 
             print(f"✓ wandb tables logged (interaction {self._interaction_count})")
         except Exception as e:
@@ -926,19 +1054,7 @@ def build_robot_messages(
     k: int | None = None,
     model_name: str | None = None,
 ):
-    """会話履歴と環境情報から介入計画用のプロンプトを構築する。"""
-
-    history_limit = k
-    if history_limit is None and env is not None:
-        history_limit = getattr(env, "max_history", None)
-    if history_limit is None:
-        history_limit = 12
-    history_limit = max(1, int(history_limit))
-
-    history_entries = logs[-history_limit:]
-    history_lines = [f"[{item.get('speaker', '?')}] {item.get('utterance', '').strip()}" for item in history_entries]
-    if not history_lines:
-        history_lines.append("(履歴なし)")
+    """会話履歴と環境情報から介入計画を作成する"""
 
     prompt_text: Optional[str] = None
     if env is not None and hasattr(env, "_make_observation"):
@@ -957,14 +1073,14 @@ def build_robot_messages(
 
 制約:
 - 出力は JSON のみ。説明や装飾は禁止。
-- intervene_now は true|false（今すぐ介入すべきか）。
-- edge_to_change は "AB" | "BC" | "CA" のいずれか。
-- strategy は "reframe" | "validate" | "bridge" から選択。
+- intervene_now は今すぐ介入すべきかを表す。 true|false のいずれか。
+- edge_to_change はどの関係を変更するかを表す。 "AB" | "BC" | "CA" のいずれか。
+- strategy は介入戦略を表す。 "reframe" | "validate" | "bridge" のいずれか。
   - "reframe": 否定的状況を肯定的視点から再解釈、認知を転換
   - "validate": 対象者の感情・意見を承認し、心理的安全性を構築
   - "bridge": 対立する者の共通点・目標を明示し、協力関係を構築
   ※どの戦略をいつ使うかは会話文脈や関係スコアから判断してください。
-- target_speaker は "A" | "B" | "C" のいずれか。（その介入を誰に向けるか）
+- target_speaker はその介入を誰に向けるかを表す。 edge_to_changeで選んだ人物のいずれか。（"AB"→"A" | "B"、"BC"→"B" | "C"、"CA"→"C" | "A"） 。
 
 出力例(あくまで例です。36通りの組み合わせがあります):
 {"intervene_now": true, "edge_to_change": "AB", "strategy": "validate", "target_speaker": "A"}
@@ -1706,28 +1822,36 @@ def main():
     if _kl_estimator not in ["k1", "k3"]:
         _kl_estimator = "k1"
     _num_mini_batches = _to_int(getattr(ppo_cfg, "num_mini_batches", 1), 1)
+    _entropy_coef = max(0.0, _to_float(getattr(ppo_cfg, "entropy_coef", 0.01), 0.01))
 
     # === PPOConfig（TRL 0.23 互換の安全パラメータ）====
-    ppo_config = PPOConfig(
-        learning_rate=_lr,
-        batch_size=max(1, _bs),                # 収集するサンプル数/更新
-        mini_batch_size=max(1, _mbs),          # ミニバッチ
-        gradient_accumulation_steps=max(1, _ga),
-        num_ppo_epochs=_epochs,
-        kl_coef=_kl,
-        kl_estimator=_kl_estimator,            # KL推定器（"k1" or "k3"）
-        num_mini_batches=max(1, _num_mini_batches),  # ミニバッチ数（更新の粒度）
-        cliprange=_cliprange,
-        vf_coef=_vf_coef,                      # 価値関数損失の係数
-        cliprange_value=_cliprange_value,
-        gamma=_gamma,                          # 割引率
-        lam=_lam,                              # GAE lambda
-        max_grad_norm=_max_grad_norm,          # 勾配クリッピング（安定性向上）
-        whiten_rewards=_whiten_rewards,        # 報酬の正規化（平均0、標準偏差1に変換）
-        ds3_gather_for_generation=True,        # ZeRO-3 を使う場合の最適化（使ってなければ無害）
-        lr_scheduler_type="constant",          # 学習率を一定に保つ（デフォルトの"linear"は0に減衰する）
-        warmup_steps=0,                        # ウォームアップなし（すぐに full lr で学習開始）
-    )
+    # TRLのバージョンによってはent_coefが存在しない場合があるため、条件付きで設定
+    ppo_config_kwargs = {
+        "learning_rate": _lr,
+        "batch_size": max(1, _bs),                # 収集するサンプル数/更新
+        "mini_batch_size": max(1, _mbs),          # ミニバッチ
+        "gradient_accumulation_steps": max(1, _ga),
+        "num_ppo_epochs": _epochs,
+        "kl_coef": _kl,
+        "kl_estimator": _kl_estimator,            # KL推定器（"k1" or "k3"）
+        "num_mini_batches": max(1, _num_mini_batches),  # ミニバッチ数（更新の粒度）
+        "cliprange": _cliprange,
+        "vf_coef": _vf_coef,                      # 価値関数損失の係数
+        "cliprange_value": _cliprange_value,
+        "gamma": _gamma,                          # 割引率
+        "lam": _lam,                              # GAE lambda
+        "max_grad_norm": _max_grad_norm,          # 勾配クリッピング（安定性向上）
+        "whiten_rewards": _whiten_rewards,        # 報酬の正規化（平均0、標準偏差1に変換）
+        "ds3_gather_for_generation": True,        # ZeRO-3 を使う場合の最適化（使ってなければ無害）
+        "lr_scheduler_type": "constant",          # 学習率を一定に保つ（デフォルトの"linear"は0に減衰する）
+        "warmup_steps": 0,                        # ウォームアップなし（すぐに full lr で学習開始）
+    }
+    
+    # TRLのバージョンによってent_coefが存在しない場合があるため、
+    # PPOTrainerWithEntropyBonusのカスタム実装を使用
+    # （ent_coefがサポートされている場合でも、カスタム実装を使うことで一貫性を保つ）
+    
+    ppo_config = PPOConfig(**ppo_config_kwargs)
     ppo_config.target_kl = _target_kl
     ppo_config.kl_adjust_up = _kl_adjust_up
     ppo_config.kl_adjust_down = _kl_adjust_down
@@ -1745,11 +1869,12 @@ def main():
 
     # === 3) PPOTrainer 準備（環境ベース報酬を差し込む） ===
     # 会話環境
+    # 後方互換性: max_historyを渡すが、env内部で新しいパラメータを優先する
     env = ConversationEnv(
         max_steps=cfg.env.max_steps,
         personas=None,  # 環境内部でcfg.env.personasから読み込む
         include_robot=cfg.env.include_robot,
-        max_history=cfg.env.max_history,
+        max_history=getattr(cfg.env, "max_history", 6),  # フォールバック値
         backend=cfg.scorer.backend,
         decay_factor=cfg.scorer.decay_factor,
         debug=cfg.env.debug,
@@ -1820,6 +1945,8 @@ def main():
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
     )
+    print(f"[PPO] Generation kwargs: temperature={gen_kwargs['temperature']}, top_p={gen_kwargs['top_p']}, max_new_tokens={gen_kwargs['max_new_tokens']}")
+    
     # TRL の PPOTrainer は args.response_length / args.temperature を参照して
     # GenerationConfig を構成するため、ここで揃えておく
     ppo_config.response_length = gen_kwargs["max_new_tokens"]
@@ -1876,9 +2003,62 @@ def main():
             return entropy
 
         for resp in samples:
-            raw_resp = resp or ""
-            visible_resp = _strip_think_tags(raw_resp)
-            plan_text = _extract_plan_candidate(visible_resp)
+            # 再推論ロジック: 不正なJSONの場合は最大3回再試行
+            retry_count = 0
+            max_retries = 3
+            plan_text = None
+            plan_obj = None
+            final_raw_resp = ""
+
+            for attempt in range(max_retries + 1):
+                if attempt == 0:
+                    # 初回: 元のレスポンスを使用
+                    current_raw_resp = resp or ""
+                else:
+                    # 再推論: 同じプロンプトで新しいサンプルを生成
+                    try:
+                        retry_count += 1
+                        # プロンプト再生成
+                        messages = build_robot_messages(env.logs, env.personas, env=env)
+                        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                        encoded = tokenizer(prompt, return_tensors="pt").to(policy.device)
+
+                        # 同じパラメータで再生成
+                        with torch.no_grad():
+                            generated = policy.generate(
+                                **encoded,
+                                **gen_kwargs,
+                            )
+                        gen_ids = generated[0, encoded["input_ids"].shape[-1]:]
+                        current_raw_resp = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+                    except Exception as e:
+                        # 再推論に失敗した場合は元のレスポンスを使用
+                        current_raw_resp = resp or ""
+                        if getattr(env, "debug", False):
+                            print(f"[reward_fn] 再推論失敗 (attempt {attempt}): {e}")
+
+                final_raw_resp = current_raw_resp
+                visible_resp = _strip_think_tags(current_raw_resp)
+                candidate_plan_text = _extract_plan_candidate(visible_resp)
+
+                # JSON妥当性チェック
+                validated_plan_obj, is_valid = _validate_plan_json(candidate_plan_text)
+
+                if is_valid and validated_plan_obj is not None:
+                    # 有効なJSONが得られた
+                    plan_text = candidate_plan_text
+                    plan_obj = validated_plan_obj
+                    break
+                else:
+                    # 検証失敗の理由をログ出力（デバッグ時のみ）
+                    if getattr(env, "debug", False) and attempt > 0:
+                        print(f"[reward_fn] JSON検証失敗 (attempt {attempt}): {candidate_plan_text[:100]}...")
+            else:
+                # すべての試行が失敗した場合のフォールバック
+                plan_text = '{"intervene_now": false}'
+                plan_obj = {"intervene_now": False}
+                if getattr(env, "debug", False):
+                    print(f"[reward_fn] JSON検証失敗、フォールバック使用 (retry_count={retry_count})")
 
             history_before = [dict(entry) for entry in env.logs]
             state_before = None
@@ -1889,6 +2069,7 @@ def main():
 
             # 安定状態の場合は介入判定をスキップ（フォールバック）
             # 注: 通常は__iter__()でスキップされるため、ここに到達するのは不安定なターンのみ
+            is_stable_now = False
             try:
                 current_rel = env.relation_snapshot()
                 if isinstance(current_rel, dict):
@@ -1898,16 +2079,13 @@ def main():
                     is_stable_now = False
                 if is_stable_now:
                     plan_text = '{"intervene_now": false}'
+                    plan_obj = {"intervene_now": False}
             except Exception:
                 pass  # 安定チェックに失敗したら通常通り進める
 
             # 選択肢をバッチコレクターに記録
-            try:
-                plan_obj = json.loads(plan_text)
+            if plan_obj:
                 batch_collector.add_decision(plan_obj)
-            except (json.JSONDecodeError, TypeError):
-                # JSON parse失敗時はスキップ
-                pass
 
             interaction_id = next(interaction_counter)
 
@@ -1958,9 +2136,6 @@ def main():
             # 不安定で介入しなかった回数をカウント
             status = info.get("status", {})
             is_stable_before = status.get("is_stable", False)
-            # 不安定判定（介入判定が行われたステップ）なら decision_counter を増やす
-            if not is_stable_before:
-                decision_counter += 1
             if not is_stable_before and not info.get("intervened"):
                 episode_stats[current_episode_id]["unstable_no_intervention_count"] += 1
 
@@ -1983,6 +2158,7 @@ def main():
                 "episode": env.episode,
                 "turn": env.t,
                 "done": bool(done),
+                "retry_count": retry_count,  # 再推論回数を記録
             }
 
             # ステップ1の場合のみepisode_info（話題・選択された地雷・地雷を持つペルソナ）を追加
@@ -2388,6 +2564,69 @@ def main():
 
     trl_ppo_trainer.get_reward = _env_get_reward
 
+    # === カスタムPPOTrainer: エントロピーボーナスを追加 ===
+    class PPOTrainerWithEntropyBonus(PPOTrainer):
+        """エントロピーボーナスをlossに追加するカスタムPPOTrainer"""
+        
+        def __init__(self, *args, entropy_coef: float = 0.0, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.entropy_coef = float(entropy_coef)
+            if self.entropy_coef > 0:
+                print(f"[PPOTrainerWithEntropyBonus] entropy_coef={self.entropy_coef} enabled")
+        
+        def compute_loss(
+            self,
+            model,
+            inputs,
+            return_outputs=False,
+        ):
+            """オリジナルのlossにエントロピーボーナスを追加"""
+            # 親クラスのcompute_lossを呼び出し
+            if return_outputs:
+                loss, outputs = super().compute_loss(model, inputs, return_outputs=True)
+            else:
+                loss = super().compute_loss(model, inputs, return_outputs=False)
+                outputs = None
+            
+            # エントロピーボーナスを追加
+            if self.entropy_coef > 0 and hasattr(self, 'state') and hasattr(self.state, 'log_history'):
+                # 最新のログからエントロピーを取得
+                for log_entry in reversed(self.state.log_history):
+                    if 'policy/entropy_avg' in log_entry:
+                        entropy_avg = float(log_entry['policy/entropy_avg'])
+                        # エントロピーボーナス（エントロピーが高いほど損失を減らす）
+                        entropy_bonus = -self.entropy_coef * entropy_avg
+                        original_loss = loss.item() if hasattr(loss, 'item') else float(loss)
+                        new_loss_value = original_loss + entropy_bonus
+                        
+                        # ターミナルにログ出力
+                        print(f"[ENTROPY_BONUS] entropy_avg={entropy_avg:.4f}, bonus={entropy_bonus:.4f}, loss: {original_loss:.4f} -> {new_loss_value:.4f}")
+                        
+                        # wandb/metricsにログ（Trainerのログ機構を使用）
+                        try:
+                            self.log({
+                                "train/loss/total_with_entropy": new_loss_value,
+                                "train/loss/total_before_entropy": original_loss,
+                                "train/loss/entropy_bonus_applied": entropy_bonus,
+                            })
+                        except Exception as e:
+                            print(f"[ENTROPY_BONUS] Failed to log metrics: {e}")
+                        
+                        # エントロピーボーナスを適用
+                        loss = loss + entropy_bonus
+                        break
+                else:
+                    if self.state.global_step % 10 == 0:  # 頻繁すぎるログを避ける
+                        print(f"[ENTROPY_BONUS] No entropy_avg in log_history (step={self.state.global_step})")
+            else:
+                if not hasattr(self, '_logged_disabled'):
+                    print(f"[ENTROPY_BONUS] Disabled: coef={self.entropy_coef}, has_state={hasattr(self, 'state')}, has_log_history={hasattr(self.state, 'log_history') if hasattr(self, 'state') else False}")
+                    self._logged_disabled = True
+            
+            if return_outputs:
+                return loss, outputs
+            return loss
+
     # TRL 0.23: train() が data["input_ids"] を参照するため
     # collator でトークナイズして渡す
     def ppo_collator(features):
@@ -2422,7 +2661,7 @@ def main():
         trl_utils.GenerationConfig = _GenerationConfigWithDefaults
         trl_ppo_trainer._generation_config_patched = True
 
-    trainer = PPOTrainer(
+    trainer = PPOTrainerWithEntropyBonus(
         args=ppo_config,
         processing_class=tokenizer,            # = tokenizer
         model=policy,
@@ -2432,6 +2671,7 @@ def main():
         eval_dataset=eval_ds,
         value_model=getattr(policy, "pretrained_model", policy),
         data_collator=ppo_collator,           # ← これが重要
+        entropy_coef=_entropy_coef,           # カスタムパラメータ
     )
 
     # 学習率スケジューラーの確認

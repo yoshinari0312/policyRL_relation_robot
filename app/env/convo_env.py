@@ -96,7 +96,26 @@ class ConversationEnv:
             self.target_human_utterances = self.max_steps * 3
 
         self.include_robot = bool(include_robot)
-        self.max_history = max(1, int(max_history))  # 介入判定LLM用
+        
+        # 後方互換性: max_historyが指定されていればそれを使用、なければ新しいパラメータを使用
+        intervention_max_history_cfg = getattr(cfg.env, "intervention_max_history", None)
+        robot_max_history_cfg = getattr(cfg.env, "robot_max_history", None)
+        
+        if intervention_max_history_cfg is not None:
+            self.intervention_max_history = max(1, int(intervention_max_history_cfg))
+        else:
+            # フォールバック: max_history または引数から
+            self.intervention_max_history = max(1, int(getattr(cfg.env, "max_history", max_history)))
+        
+        if robot_max_history_cfg is not None:
+            self.robot_max_history = max(1, int(robot_max_history_cfg))
+        else:
+            # フォールバック: max_history または引数から
+            self.robot_max_history = max(1, int(getattr(cfg.env, "max_history", max_history)))
+        
+        # 後方互換性のため、max_historyも残す（非推奨）
+        self.max_history = self.intervention_max_history  # デフォルトは介入判定用と同じ
+        
         self.max_history_human = max(1, int(getattr(cfg.env, "max_history_human", 12)))  # 人間LLM用
         self.max_history_relation = max(1, int(getattr(cfg.env, "max_history_relation", 3)))  # 関係性LLM用
         self.debug = bool(debug)
@@ -1031,8 +1050,8 @@ class ConversationEnv:
 
     def _make_observation(self) -> str:
         context = self.planning_context()
-        # max_history個の人間発話 + その間のロボット発話を取得
-        filtered_logs = filter_logs_by_human_count(self.logs, self.max_history)
+        # intervention_max_history個の人間発話 + その間のロボット発話を取得（介入判定用）
+        filtered_logs = filter_logs_by_human_count(self.logs, self.intervention_max_history)
         history_lines = [f"[{item.get('speaker', '?')}] {item.get('utterance', '').strip()}" for item in filtered_logs]
         if not history_lines:
             history_lines = ["(履歴なし)"]
@@ -1118,8 +1137,8 @@ class ConversationEnv:
 
         strategy = plan.get("strategy")
 
-        # max_history個の人間発話 + その間のロボット発話を取得
-        filtered_logs = filter_logs_by_human_count(self.logs, self.max_history)
+        # robot_max_history個の人間発話 + その間のロボット発話を取得（ロボット発話生成用）
+        filtered_logs = filter_logs_by_human_count(self.logs, self.robot_max_history)
         history_lines = [
             f"[{entry.get('speaker', '?')}] {entry.get('utterance', '').strip()}" for entry in filtered_logs
         ]
@@ -1143,7 +1162,7 @@ class ConversationEnv:
         base_backoff = getattr(cfg.llm, "base_backoff", 0.5) or 0.5
         if client and deployment:
             user_payload = (
-                "あなたは関係性を安定させるロボットの発話生成器です。出力は日本語で一文のみ。話者ラベルや括弧は使わない。\n"
+                "あなたは会話の調整役です。出力は日本語で一文のみ。話者ラベルや括弧は使わない。\n"
                 "会話履歴を参考にしながら、以下の指示に従って発話を生成してください。\n\n"
                 f"指示: {directive}\n"
                 f"会話履歴:\n{history_text}\n\n"
@@ -1153,7 +1172,7 @@ class ConversationEnv:
                 "- 一文のみ (60字前後)。\n"
             )
             messages = [
-                {"role": "system", "content": "あなたは戦略を元に、介入ロボットの発話内容を作成します。常に日本語の一文だけを返します。"},
+                {"role": "system", "content": "あなたは会話の調整役として、適切な発話内容を作成します。常に日本語の一文だけを返します。"},
                 {"role": "user", "content": user_payload},
             ]
             for attempt in range(1, max_attempts + 1):
@@ -1173,12 +1192,18 @@ class ConversationEnv:
                         if cleaned:
                             return {"speaker": "ロボット", "utterance": cleaned}
                 except Exception as exc:
-                    if getattr(_CFG.env, "debug", False):
+                    # Azure OpenAIのcontent filterエラーの場合は即座にフォールバック
+                    if "content_filter" in str(exc) or "ResponsibleAIPolicyViolation" in str(exc):
+                        if getattr(get_config().env, "debug", False):
+                            print(f"[robot_utterance] Azure content filter triggered, using fallback immediately")
+                        break  # すぐにフォールバックに移行
+
+                    if getattr(get_config().env, "debug", False):
                         print(f"[robot_utterance] attempt {attempt} failed:", exc)
                     if attempt < max_attempts:
                         time.sleep(base_backoff * (2 ** (attempt - 1)))
                     else:
-                        if getattr(_CFG.env, "debug", False):
+                        if getattr(get_config().env, "debug", False):
                             print("[robot_utterance] all attempts failed, falling back to local heuristic")
         return {"speaker": "ロボット", "utterance": fallback_text}
 

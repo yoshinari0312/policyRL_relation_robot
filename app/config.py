@@ -57,7 +57,9 @@ class EnvCfg:
     max_steps: Optional[int] = None
     max_rounds: Optional[int] = None
     include_robot: Optional[bool] = None
-    max_history: Optional[int] = None
+    max_history: Optional[int] = None  # 後方互換性のため残す（非推奨）
+    intervention_max_history: Optional[int] = None  # 介入判定LLM用の会話履歴（人間発話数）
+    robot_max_history: Optional[int] = None  # ロボット発言LLM用の会話履歴（人間発話数）
     max_history_human: Optional[int] = None
     max_history_relation: Optional[int] = None
     personas: Optional[Any] = None  # List[str] または Dict[str, Dict[str, Any]]（triggers含む）
@@ -129,7 +131,9 @@ class PPOCfg:
     entropy_floor: Optional[float] = None
     entropy_patience: Optional[int] = None
     entropy_monitor_warmup: Optional[int] = None
+    entropy_coef: Optional[float] = None
     filter_zero_rewards: Optional[bool] = None
+    whiten_rewards: Optional[bool] = None  # 報酬の正規化
     topic_overlap_weight: Optional[float] = None
     topic_miss_penalty: Optional[float] = None
     topic_similarity_threshold: Optional[float] = None
@@ -184,7 +188,9 @@ def _validate_required_fields(cfg: AppConfig) -> None:
         if missing:
             missing_sections.append(f"{section}: {', '.join(missing)}")
 
-    _require("env", cfg.env, ["max_steps", "include_robot", "max_history", "debug"])
+    _require("env", cfg.env, ["max_steps", "include_robot", "debug"])
+    # max_history は後方互換性のため残すが必須ではない
+    # intervention_max_history と robot_max_history が推奨される
     _require("scorer", cfg.scorer, ["backend", "use_ema", "decay_factor"])
     _require("ollama", cfg.ollama, ["model"])
     _require("ollama.gen_options", getattr(cfg.ollama, "gen_options", None), ["temperature", "top_p", "num_ctx"])

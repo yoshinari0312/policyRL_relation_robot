@@ -45,6 +45,10 @@ class BatchSummaryCollector:
             self.choice_counts["edge_to_change"][edge] += 1
             self.choice_counts["strategy"][strategy] += 1
             self.choice_counts["target_speaker"][target] += 1
+    
+    def get_strategy_distribution(self) -> Dict[str, int]:
+        """戦略の分布を返す（エントロピー計算用）"""
+        return dict(self.choice_counts["strategy"])
 
     def add_step(self, reward: float, intervened: bool, is_stable_before: bool, plan_error: bool):
         """ステップの結果を記録"""
