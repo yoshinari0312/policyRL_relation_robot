@@ -14,7 +14,7 @@ from network_metrics import BALANCED, UNBALANCED, analyze_relations_from_scores
 from relation_scorer import RelationScorer
 from utils import filter_logs_by_human_count
 
-_PLANNER_STRATEGIES = ("reframe", "validate", "bridge")
+_PLANNER_STRATEGIES = ("plan", "validate", "bridge")
 
 # プラン検証用の定数
 _TARGET_EDGES = {"AB", "BC", "CA"}  # 変更対象となるエッジ（ペア関係）
@@ -1100,9 +1100,9 @@ class ConversationEnv:
             edge_raw = "AB"
         plan["edge_to_change"] = edge_raw
 
-        strategy_raw = str(payload.get("strategy", "reframe")).strip()
+        strategy_raw = str(payload.get("strategy", "plan")).strip()
         if strategy_raw not in _PLANNER_STRATEGIES:
-            strategy_raw = "reframe"
+            strategy_raw = "plan"
         plan["strategy"] = strategy_raw
 
         target_raw = str(payload.get("target_speaker", "A")).upper().strip()
@@ -1145,11 +1145,11 @@ class ConversationEnv:
         history_text = "\n".join(history_lines) if history_lines else "(履歴なし)"
 
         directive_map = {
-            "reframe": f"直前の{target_name}さんや他の参加者の発言から、否定的な側面ではなく肯定的な意図や建設的な視点を見出し、それを一文で伝えてください。対立を『視点の違い』として価値あるものに再定義してください。",
+            "plan": f"直前の{target_name}さんや他の参加者の発言から、「これからどうするか」という未来志向の視点を提示してください。具体的な次の一歩や小さな行動案を一文で示し、前向きな行動を促してください。",
             "validate": f"{target_name}さんの感情や意見を明確に承認・共感し、その価値を認めてください。心理的安全性を作り、建設的な対話を可能にする一文を述べてください。",
             "bridge": f"{target_name}さんと{partner_name}さんの間に共通点・共通の目標・相互依存性を見出してください。対立ではなく協力関係として捉え直せる視点を一文で提示してください。",
         }
-        directive = directive_map.get(strategy, directive_map["reframe"])
+        directive = directive_map.get(strategy, directive_map["plan"])
 
         fallback_text = self._fallback_intervention_text(target_name, partner_name, strategy)
         if simulate:
@@ -1210,11 +1210,11 @@ class ConversationEnv:
     def _fallback_intervention_text(self, target_name: str, partner_name: str, strategy: str) -> str:
         # フォールバック用の介入発話テンプレート
         templates = {
-            "reframe": f"{target_name}さん、その視点には建設的な意図があると思います。",
+            "plan": f"{target_name}さん、次の一歩として、まず小さなことから始めてみませんか？",
             "validate": f"{target_name}さん、あなたの意見はとても大切です。もっと聞かせてください。",
             "bridge": f"{target_name}さん、{partner_name}さん、お二人には共通の目標があると思います。",
         }
-        return templates.get(strategy, templates["reframe"])
+        return templates.get(strategy, templates["plan"])
 
     def _bootstrap_humans(self, target_turns: int) -> None:
         # 人間参加者の発話を追加して会話を進める

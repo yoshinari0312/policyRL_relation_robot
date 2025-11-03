@@ -43,8 +43,8 @@ def test_prompt_optimization():
 - 出力は JSON のみ。説明や装飾は禁止。
 - intervene_now は true|false（今すぐ介入すべきか）。
 - edge_to_change は "AB" | "BC" | "CA" のいずれか。
-- strategy は reframe | validate | bridge から選択。
-  - reframe: 否定的状況を肯定的視点から再解釈、認知を転換
+- strategy は plan | validate | bridge から選択。
+  - plan: 「これからどうするか」という未来志向の視点を提示。具体的な次の一歩や小さな行動案を示し、前向きな行動を促す
   - validate: 対象者の感情・意見を承認し、心理的安全性を構築
   - bridge: 対立する者の共通点・目標を明示し、協力関係を構築
   ※どの戦略をいつ使うかは会話文脈や関係スコアから判断してください。
@@ -53,7 +53,7 @@ def test_prompt_optimization():
 - intervene_now=false の場合は何も指定しない。
 
 出力例:
-{"intervene_now": true, "edge_to_change": "AB", "strategy": "reframe", "target_speaker": "A"}
+{"intervene_now": true, "edge_to_change": "AB", "strategy": "plan", "target_speaker": "A"}
 {"intervene_now": false}
 """
 

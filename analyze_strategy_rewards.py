@@ -32,7 +32,7 @@ with open('app/logs/ppo_run-20251101-073508/conversation_summary.jsonl', 'r') as
 print(f"Total interventions: {total_interventions}")
 print()
 
-for strategy in ['bridge', 'validate', 'reframe']:
+for strategy in ['bridge', 'validate', 'plan']:
     rewards = strategy_rewards.get(strategy, [])
     if rewards:
         avg = sum(rewards) / len(rewards)

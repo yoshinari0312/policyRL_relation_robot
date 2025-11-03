@@ -445,7 +445,7 @@ def _validate_plan_json(text: str) -> tuple[dict | None, bool]:
 
         # 値の妥当性チェック
         strategy = parsed_obj.get("strategy")
-        if strategy not in ["reframe", "validate", "bridge"]:
+        if strategy not in ["plan", "validate", "bridge"]:
             return None, False
 
         edge_to_change = str(parsed_obj.get("edge_to_change", "")).upper()
@@ -991,13 +991,13 @@ class TrainingRunLogger:
                             # 戦略分布（介入した場合のみ）
                             "strategy/validate_ratio": strategy_counts.get("validate", 0) / total,
                             "strategy/bridge_ratio": strategy_counts.get("bridge", 0) / total,
-                            "strategy/reframe_ratio": strategy_counts.get("reframe", 0) / total,
+                            "strategy/plan_ratio": strategy_counts.get("plan", 0) / total,
                             "strategy/no_intervention_ratio": strategy_counts.get("no_intervention", 0) / total,
 
                             # 戦略カウント
                             "strategy/validate_count": strategy_counts.get("validate", 0),
                             "strategy/bridge_count": strategy_counts.get("bridge", 0),
-                            "strategy/reframe_count": strategy_counts.get("reframe", 0),
+                            "strategy/plan_count": strategy_counts.get("plan", 0),
                             "strategy/no_intervention_count": strategy_counts.get("no_intervention", 0),
 
                             # 介入率メトリクス
@@ -1044,7 +1044,7 @@ def _default_model_name() -> str | None:
         return None
 
 
-_PLANNER_STRATEGIES = ("reframe", "validate", "bridge")
+_PLANNER_STRATEGIES = ("plan", "validate", "bridge")
 
 
 def build_robot_messages(
@@ -1075,8 +1075,8 @@ def build_robot_messages(
 - 出力は JSON のみ。説明や装飾は禁止。
 - intervene_now は今すぐ介入すべきかを表す。 true|false のいずれか。
 - edge_to_change はどの関係を変更するかを表す。 "AB" | "BC" | "CA" のいずれか。
-- strategy は介入戦略を表す。 "reframe" | "validate" | "bridge" のいずれか。
-  - "reframe": 否定的状況を肯定的視点から再解釈、認知を転換
+- strategy は介入戦略を表す。 "plan" | "validate" | "bridge" のいずれか。
+  - "plan": 「これからどうするか」という未来志向の視点を提示。具体的な次の一歩や小さな行動案を示し、前向きな行動を促す
   - "validate": 対象者の感情・意見を承認し、心理的安全性を構築
   - "bridge": 対立する者の共通点・目標を明示し、協力関係を構築
   ※どの戦略をいつ使うかは会話文脈や関係スコアから判断してください。
@@ -1085,7 +1085,7 @@ def build_robot_messages(
 出力例(あくまで例です。36通りの組み合わせがあります):
 {"intervene_now": true, "edge_to_change": "AB", "strategy": "validate", "target_speaker": "A"}
 {"intervene_now": true, "edge_to_change": "BC", "strategy": "bridge", "target_speaker": "B"}
-{"intervene_now": true, "edge_to_change": "CA", "strategy": "reframe", "target_speaker": "C"}
+{"intervene_now": true, "edge_to_change": "CA", "strategy": "plan", "target_speaker": "C"}
 {"intervene_now": false}
 """
 

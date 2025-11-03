@@ -149,8 +149,8 @@ class InterventionSimulator:
 - 出力は JSON のみ。説明や装飾は禁止。
 - intervene_now は今すぐ介入すべきかを表す。 true|false のいずれか。
 - edge_to_change はどの関係を変更するかを表す。 "AB" | "BC" | "CA" のいずれか。
-- strategy は介入戦略を表す。 "reframe" | "validate" | "bridge" のいずれか。
-  - "reframe": 否定的状況を肯定的視点から再解釈、認知を転換
+- strategy は介入戦略を表す。 "plan" | "validate" | "bridge" のいずれか。
+  - "plan": 「これからどうするか」という未来志向の視点を提示。具体的な次の一歩や小さな行動案を示し、前向きな行動を促す
   - "validate": 対象者の感情・意見を承認し、心理的安全性を構築
   - "bridge": 対立する者の共通点・目標を明示し、協力関係を構築
   ※どの戦略をいつ使うかは会話文脈や関係スコアから判断してください。
@@ -159,8 +159,13 @@ class InterventionSimulator:
 出力例(あくまで例です。36通りの組み合わせがあります):
 {"intervene_now": true, "edge_to_change": "AB", "strategy": "validate", "target_speaker": "A"}
 {"intervene_now": true, "edge_to_change": "BC", "strategy": "bridge", "target_speaker": "B"}
-{"intervene_now": true, "edge_to_change": "CA", "strategy": "reframe", "target_speaker": "C"}
+{"intervene_now": true, "edge_to_change": "CA", "strategy": "plan", "target_speaker": "C"}
 {"intervene_now": false}
+"""
+
+    user_content = f"""
+会話履歴:
+{history_text}
 """
 
         messages = [
@@ -248,8 +253,8 @@ class InterventionSimulator:
 - 出力は JSON のみ。説明や装飾は禁止。
 - intervene_now は今すぐ介入すべきかを表す。 true|false のいずれか。
 - edge_to_change はどの関係を変更するかを表す。 "AB" | "BC" | "CA" のいずれか。
-- strategy は介入戦略を表す。 "reframe" | "validate" | "bridge" のいずれか。
-  - "reframe": 否定的状況を肯定的視点から再解釈、認知を転換
+- strategy は介入戦略を表す。 "plan" | "validate" | "bridge" のいずれか。
+  - "plan": 「これからどうするか」という未来志向の視点を提示。具体的な次の一歩や小さな行動案を示し、前向きな行動を促す
   - "validate": 対象者の感情・意見を承認し、心理的安全性を構築
   - "bridge": 対立する者の共通点・目標を明示し、協力関係を構築
   ※どの戦略をいつ使うかは会話文脈や関係スコアから判断してください。
@@ -258,7 +263,7 @@ class InterventionSimulator:
 出力例(あくまで例です。36通りの組み合わせがあります):
 {"intervene_now": true, "edge_to_change": "AB", "strategy": "validate", "target_speaker": "A"}
 {"intervene_now": true, "edge_to_change": "BC", "strategy": "bridge", "target_speaker": "B"}
-{"intervene_now": true, "edge_to_change": "CA", "strategy": "reframe", "target_speaker": "C"}
+{"intervene_now": true, "edge_to_change": "CA", "strategy": "plan", "target_speaker": "C"}
 {"intervene_now": false}
 """
         
