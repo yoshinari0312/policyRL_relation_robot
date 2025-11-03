@@ -1212,134 +1212,312 @@ class DummyRewardModel(nn.Module):
     TRL 0.23 の PPOTrainer は torch.nn.Module を期待し `.to()` を呼ぶため、
     forward が呼ばれない最小実装を用意する。
     """
+    
+    # transformersモデルが持つ標準的な属性
+    base_model_prefix = "transformer"
 
     def __init__(self):
         super().__init__()
+        # ダミーのバックボーンモデルを作成（get_rewardで使用される）
+        # 実際には呼ばれないが、属性アクセスを満たすため
+        class DummyBackbone(nn.Module):
+            def __init__(self):
+                super().__init__()
+            
+            def forward(self, *args, **kwargs):
+                # get_rewardから呼ばれる可能性があるので、適切なダミー出力を返す
+                batch_size = kwargs.get('input_ids', args[0] if args else torch.zeros(1, 1)).shape[0]
+                seq_length = kwargs.get('input_ids', args[0] if args else torch.zeros(1, 1)).shape[1]
+                hidden_size = 4096  # Qwen2.5の隠れ層サイズ
+                
+                # ダミーの出力を作成
+                class DummyOutput:
+                    def __init__(self):
+                        self.hidden_states = (torch.zeros(batch_size, seq_length, hidden_size),)
+                        self.last_hidden_state = torch.zeros(batch_size, seq_length, hidden_size)
+                
+                return DummyOutput()
+        
+        self.transformer = DummyBackbone()
 
     def forward(self, *args, **kwargs):  # pragma: no cover - 呼ばれない想定
-        raise RuntimeError("DummyRewardModel.forward should not be called")
+        # get_rewardから呼ばれる可能性があるので、ダミー出力を返す
+        return self.transformer.forward(*args, **kwargs)
 
 # === カスタムPPOTrainer: エントロピーボーナスを追加 ===
-# TRL PPOTrainerのbatch_forward()メソッドをフックして
-# エントロピーボーナスを損失に追加します
+# TRL PPOTrainer.train()メソッドをオーバーライドして、
+# 損失計算時にエントロピーボーナスを追加します（理論的に正しい実装）
+
+def _create_train_method_with_entropy_bonus(get_reward_fn=None):
+    """
+    TRL PPOTrainer.train()メソッドにエントロピーボーナスを追加したバージョンを生成
+    
+    実行時に元のtrain()メソッドを取得し、損失計算部分を修正してエントロピーボーナスを追加します。
+    
+    Args:
+        get_reward_fn: カスタムget_reward関数（環境ベースの報酬用）。Noneの場合はデフォルトを使用
+    """
+    import inspect
+    import re
+    from trl import PPOTrainer
+    import textwrap
+    
+
+    cfg = get_config()
+    ppo_cfg = cfg.ppo
+
+    # 元のtrain()メソッドのソースコードを取得
+    original_code = inspect.getsource(PPOTrainer.train)
+    
+    # インデントを除去（def train(self): の部分だけ残す）
+    original_code = textwrap.dedent(original_code)
+    
+    # 損失計算部分を修正
+    # 元の行（237行目付近）:
+    #     pg_loss = masked_mean(pg_loss_max, ~padding_mask[micro_batch_inds])
+    #     loss = pg_loss + args.vf_coef * vf_loss
+    
+    # パターンマッチング（より緩い条件）
+    pattern = r'(pg_loss = masked_mean\(pg_loss_max,)'
+    
+    # まず該当箇所があるか確認
+    if not re.search(pattern, original_code):
+        print("[ERROR] Could not find pg_loss calculation in train() method", flush=True)
+        return None
+    
+    # loss計算の直後にエントロピーボーナスを追加
+    loss_pattern = r'(loss = pg_loss \+ args\.vf_coef \* vf_loss)'
+    
+    replacement = r'''\1
+                        # [ENTROPY_BONUS] エントロピーボーナスを損失から引く
+                        if hasattr(self, 'custom_entropy_coef') and self.custom_entropy_coef > 0:
+                            try:
+                                # logitsのデバイスを基準として使用
+                                target_device = logits.device
+                                
+                                # padding_maskを同じデバイスに同期転送
+                                padding_mask_moved = padding_mask.to(target_device, non_blocking=False)
+                                
+                                # エントロピー計算
+                                prob_dist = torch.nn.functional.softmax(logits, dim=-1)
+                                entropy = torch.logsumexp(logits, dim=-1) - torch.sum(prob_dist * logits, dim=-1)
+                                
+                                # micro_batch_indsをテンソルに変換して同じデバイスに配置
+                                if isinstance(micro_batch_inds, np.ndarray):
+                                    inds = torch.from_numpy(micro_batch_inds).long().to(target_device, non_blocking=False)
+                                elif isinstance(micro_batch_inds, torch.Tensor):
+                                    inds = micro_batch_inds.to(target_device, non_blocking=False)
+                                else:
+                                    inds = torch.tensor(micro_batch_inds, dtype=torch.long, device=target_device)
+                                
+                                # マスク作成（全て同じデバイス上で実行）
+                                mask = ~padding_mask_moved[inds]
+                                
+                                # masked_meanを直接計算（デバイス問題を回避）
+                                mask_sum = mask.sum()
+                                if mask_sum > 0:
+                                    mean_entropy = (entropy * mask).sum() / mask_sum
+                                else:
+                                    mean_entropy = torch.tensor(0.0, device=target_device)
+                                
+                                # エントロピー係数のスケジューリング（update数に応じて減衰）
+                                if update <= getattr(self, 'entropy_transition_updates', [20, 60])[0]:
+                                    current_entropy_coef = getattr(self, 'entropy_coef_phase1', 0.03)
+                                elif update <= getattr(self, 'entropy_transition_updates', [20, 60])[1]:
+                                    current_entropy_coef = getattr(self, 'entropy_coef_phase2', 0.02)
+                                else:
+                                    current_entropy_coef = getattr(self, 'entropy_coef_phase3', 0.01)
+
+                                entropy_bonus = current_entropy_coef * mean_entropy
+                                
+                                # エントロピーボーナスの上限クリップ（yaml設定から読み込み）
+                                max_entropy_bonus = getattr(self, 'max_entropy_bonus', 0.5)
+                                if entropy_bonus > max_entropy_bonus:
+                                    entropy_bonus = torch.tensor(max_entropy_bonus, device=target_device)
+                                    if gradient_accumulation_idx == 0 and minibatch_idx == 0 and ppo_epoch_idx == 0:
+                                        accelerator.print(f"[ENTROPY_BONUS] クリップ適用: {current_entropy_coef * mean_entropy.item():.4f} → {max_entropy_bonus:.4f}")
+                                
+                                # lossをtarget_deviceに移動（もし異なるデバイスにあれば）
+                                if loss.device != target_device:
+                                    loss = loss.to(target_device)
+                                
+                                loss_before = loss.item()
+                                loss = loss - entropy_bonus
+                                
+                                # メトリクスを記録（wandbとlogger）
+                                if gradient_accumulation_idx == 0 and minibatch_idx == 0 and ppo_epoch_idx == 0:
+                                    mean_entropy_val = mean_entropy.item()
+                                    entropy_bonus_val = entropy_bonus.item()
+                                    loss_after_val = loss.item()
+                                    
+                                    # コンソール出力
+                                    accelerator.print(f"[ENTROPY_BONUS] update={update} mean_entropy={mean_entropy_val:.4f} bonus={entropy_bonus_val:.4f} (coef={current_entropy_coef:.3f}) loss: {loss_before:.4f} -> {loss_after_val:.4f}")
+                                    
+                                    # Trainerのログ経路に記録（metrics.jsonl + wandb自動連携）
+                                    try:
+                                        self.log({
+                                            "train/entropy/mean": mean_entropy_val,
+                                            "train/entropy/bonus": entropy_bonus_val,
+                                            "train/entropy/coef": current_entropy_coef,
+                                            "train/loss/before_entropy": loss_before,
+                                            "train/loss/after_entropy": loss_after_val,
+                                        })
+                                    except Exception as log_err:
+                                        accelerator.print(f"[ENTROPY_BONUS] self.log failed: {log_err}")
+                                    
+                                    # wandbに直接記録（フォールバック）
+                                    try:
+                                        import wandb
+                                        if wandb.run is not None:
+                                            wandb.log({
+                                                "entropy/mean_entropy": mean_entropy_val,
+                                                "entropy/bonus": entropy_bonus_val,
+                                                "entropy/coef": current_entropy_coef,
+                                                "entropy/loss_before": loss_before,
+                                                "entropy/loss_after": loss_after_val,
+                                                "entropy/loss_reduction": loss_before - loss_after_val,
+                                                "ppo/update": update,
+                                            })  # stepを指定しない → Trainerの現在stepに自動追従
+                                    except Exception as wandb_err:
+                                        accelerator.print(f"[ENTROPY_BONUS] wandb log failed: {wandb_err}")
+                                    
+                                    # loggerに記録
+                                    if hasattr(self, 'logger') and self.logger is not None:
+                                        try:
+                                            self.logger.log_event(
+                                                event="entropy_bonus",
+                                                update=update,
+                                                mean_entropy=mean_entropy_val,
+                                                entropy_bonus=entropy_bonus_val,
+                                                loss_before=loss_before,
+                                                loss_after=loss_after_val,
+                                                loss_reduction=loss_before - loss_after_val,
+                                            )
+                                        except Exception as logger_err:
+                                            accelerator.print(f"[ENTROPY_BONUS] logger failed: {logger_err}")
+                            except Exception as e:
+                                if gradient_accumulation_idx == 0 and minibatch_idx == 0 and ppo_epoch_idx == 0:
+                                    import traceback
+                                    accelerator.print(f"[ENTROPY_BONUS ERROR] {type(e).__name__}: {e}")
+                                    tb = traceback.format_exc()
+                                    accelerator.print("[ENTROPY_BONUS ERROR] Traceback:")
+                                    accelerator.print(tb)
+                                # エラー時はボーナスなしで続行
+                                pass'''
+    
+    modified_code = re.sub(loss_pattern, replacement, original_code)
+    
+    if modified_code == original_code:
+        print("[WARNING] Failed to patch train() method - pattern not found", flush=True)
+        return None
+    else:
+        print("[SUCCESS] train() method patched with entropy bonus", flush=True)
+    
+    # 修正したコードをコンパイル
+    namespace = {}
+    try:
+        # 必要なインポートを追加
+        import torch
+        import numpy as np
+        import time
+        import math
+        import gc
+        from transformers import GenerationConfig
+        from trl.trainer.ppo_trainer import (
+            batch_generation,
+            forward,
+            get_reward,
+            masked_mean,
+            masked_whiten,
+            selective_log_softmax,
+            unwrap_model_for_generation,
+            INVALID_LOGPROB,
+        )
+        from trl.trainer.utils import (
+            truncate_response,
+            first_true_indices,
+        )
+        from contextlib import nullcontext
+        from torch.nn.utils import clip_grad_norm_
+        from accelerate.utils import release_memory
+        
+        # empty_cache は release_memory のエイリアス
+        def empty_cache():
+            release_memory()
+        
+        # カスタムget_reward関数が渡された場合は使用
+        if get_reward_fn is not None:
+            get_reward_to_use = get_reward_fn
+        else:
+            get_reward_to_use = get_reward
+        
+        # namespaceに追加
+        namespace.update({
+            'torch': torch,
+            'np': np,
+            'time': time,
+            'math': math,
+            'gc': gc,
+            'GenerationConfig': GenerationConfig,
+            'batch_generation': batch_generation,
+            'forward': forward,
+            'get_reward': get_reward_to_use,  # パッチされた関数を使用
+            'masked_mean': masked_mean,
+            'masked_whiten': masked_whiten,
+            'selective_log_softmax': selective_log_softmax,
+            'unwrap_model_for_generation': unwrap_model_for_generation,
+            'INVALID_LOGPROB': INVALID_LOGPROB,
+            'truncate_response': truncate_response,
+            'first_true_indices': first_true_indices,
+            'nullcontext': nullcontext,
+            'clip_grad_norm_': clip_grad_norm_,
+            'release_memory': release_memory,
+            'empty_cache': empty_cache,
+        })
+        
+        exec(modified_code, namespace)
+        return namespace['train']
+    except SyntaxError as e:
+        print(f"[ERROR] Syntax error in modified train(): {e}", flush=True)
+        # デバッグ用に問題のある行を表示
+        lines = modified_code.split('\n')
+        if hasattr(e, 'lineno') and e.lineno:
+            start = max(0, e.lineno - 3)
+            end = min(len(lines), e.lineno + 2)
+            print(f"[DEBUG] Lines {start}-{end}:")
+            for i in range(start, end):
+                marker = '>>>' if i == e.lineno - 1 else '   '
+                print(f"{marker} {i+1:3d}: {lines[i]}")
+        return None
 
 class PPOTrainerWithEntropyBonus(PPOTrainer):
-    """エントロピーボーナスをlossに追加するカスタムPPOTrainer"""
+    """
+    エントロピーボーナスを損失に追加するカスタムPPOTrainer
+    
+    標準的なPPO実装:
+        loss = policy_loss + vf_coef * value_loss
+    
+    この実装:
+        loss = policy_loss + vf_coef * value_loss - entropy_coef * entropy
+        
+    これにより、方策が探索的になることを奨励します。
+    """
     
     def __init__(self, *args, entropy_coef: float = 0.0, **kwargs):
         super().__init__(*args, **kwargs)
         self.custom_entropy_coef = float(entropy_coef)
-        self._step_count = 0
         if self.custom_entropy_coef > 0:
-            print(f"[PPOTrainerWithEntropyBonus] custom_entropy_coef={self.custom_entropy_coef} enabled", flush=True)
+            print(f"[PPOTrainerWithEntropyBonus] custom_entropy_coef={self.custom_entropy_coef} ENABLED", flush=True)
+            print(f"[PPOTrainerWithEntropyBonus] Will subtract entropy_coef * entropy from loss", flush=True)
         else:
-            print(f"[PPOTrainerWithEntropyBonus] custom_entropy_coef={self.custom_entropy_coef} - DISABLED", flush=True)
-    
-    def batched_forward_pass(
-        self,
-        model,
-        queries,
-        responses,
-        model_inputs,
-        return_logits=False,
-        response_masks=None,
-    ):
-        """
-        元のbatched_forward_pass()を呼び出し、
-        返されたlogprobsとref_logprobsを使ってエントロピーを計算し、
-        statsに追加します
-        """
-        print(f"[ENTROPY_BONUS] batched_forward_pass called! custom_entropy_coef={self.custom_entropy_coef}", flush=True)
-        
-        # 親クラスのメソッドを呼び出し
-        result = super().batched_forward_pass(
-            model, queries, responses, model_inputs, 
-            return_logits=return_logits, response_masks=response_masks
-        )
-        
-        # resultはタプル: (all_logprobs, all_logits, all_values, all_masks)
-        # または (all_logprobs, None, all_values, all_masks)
-        all_logprobs = result[0]
-        
-        # エントロピーを計算（logprobsから）
-        # entropy = -sum(p * log(p)) ≈ -sum(exp(logp) * logp)
-        # ただし、PPOではaction空間が離散的なので、
-        # 既にlogprobsが計算されているため、より簡単な方法として：
-        # エントロピー ≈ -mean(logprobs) （これは近似）
-        # より正確には、モデルのlogitsから計算すべきですが、
-        # ここではlogprobsの負の平均を使用
-        
-        if self.custom_entropy_coef > 0:
-            import torch
-            # all_logprobsの形状: (batch_size, seq_len)
-            # マスクを適用して有効なトークンのみ使用
-            all_masks = result[3]
-            masked_logprobs = all_logprobs * all_masks
-            entropy_approx = -(masked_logprobs.sum() / all_masks.sum())
-            
-            # ステップカウント更新（最初の呼び出しを検出）
-            self._step_count += 1
-            
-            # 最初の呼び出しは必ずログ出力
-            if self._step_count == 1:
-                print(f"[ENTROPY_BONUS] *** FIRST CALL *** batched_forward_pass called, approx_entropy={entropy_approx.item():.4f}", flush=True)
-            elif self._step_count <= 10 or self._step_count % 100 == 0:
-                print(f"[ENTROPY_BONUS] Step {self._step_count}: approx_entropy={entropy_approx.item():.4f}", flush=True)
-            
-            # エントロピーをstatsに追加（後でlossに使用できるように）
-            if not hasattr(self, '_current_entropy'):
-                self._current_entropy = entropy_approx.detach()
-            else:
-                # EMAsmoothingで更新
-                self._current_entropy = 0.9 * self._current_entropy + 0.1 * entropy_approx.detach()
-        
-        return result
-    
-    def compute_rewards(
-        self,
-        scores,
-        logprobs,
-        ref_logprobs,
-        masks,
-    ):
-        """
-        元のcompute_rewards()を呼び出し、
-        エントロピーボーナスを追加します
-        """
-        print(f"[ENTROPY_BONUS] compute_rewards called! custom_entropy_coef={self.custom_entropy_coef}", flush=True)
-        
-        # 親クラスのメソッドを呼び出してKLペナルティ付きrewardsを取得
-        rewards, non_score_rewards, kl_coef = super().compute_rewards(
-            scores, logprobs, ref_logprobs, masks
-        )
-        
-        # エントロピーボーナスを追加
-        if self.custom_entropy_coef > 0 and hasattr(self, '_current_entropy'):
-            # rewards形状: (batch_size, seq_len)
-            # エントロピーボーナスを各トークンに均等に配分
-            entropy_bonus_per_token = self.custom_entropy_coef * self._current_entropy
-            rewards = rewards + entropy_bonus_per_token
-            
-            # ログ出力（最初の呼び出し時は必ず出力）
-            avg_reward_before = (rewards - entropy_bonus_per_token).mean().item()
-            avg_reward_after = rewards.mean().item()
-            
-            if not hasattr(self, '_reward_call_count'):
-                self._reward_call_count = 0
-            self._reward_call_count += 1
-            
-            if self._reward_call_count == 1:
-                print(f"[ENTROPY_BONUS] *** FIRST REWARD CALL *** "
-                      f"entropy={self._current_entropy.item():.4f}, "
-                      f"bonus={entropy_bonus_per_token.item():.4f}, "
-                      f"reward: {avg_reward_before:.4f} -> {avg_reward_after:.4f}", flush=True)
-            elif self._step_count <= 10 or self._step_count % 100 == 0:
-                print(f"[ENTROPY_BONUS] Reward #{self._reward_call_count}: "
-                      f"entropy={self._current_entropy.item():.4f}, "
-                      f"bonus={entropy_bonus_per_token.item():.4f}, "
-                      f"reward: {avg_reward_before:.4f} -> {avg_reward_after:.4f}", flush=True)
-        
-        return rewards, non_score_rewards, kl_coef
+            print(f"[PPOTrainerWithEntropyBonus] custom_entropy_coef={self.custom_entropy_coef} DISABLED", flush=True)
+
+# train()メソッドは main() 内でパッチ（get_rewardのパッチ後に適用する必要があるため）
+# try:
+#     PPOTrainerWithEntropyBonus.train = _create_train_method_with_entropy_bonus()
+# except Exception as e:
+#     print(f"[ERROR] Failed to create custom train() method: {e}", flush=True)
+#     print("[FALLBACK] Using parent PPOTrainer.train() without entropy bonus", flush=True)
 
 def main():
     cfg = get_config()
@@ -2145,11 +2323,17 @@ def main():
                         prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
                         encoded = tokenizer(prompt, return_tensors="pt").to(policy.device)
 
-                        # 同じパラメータで再生成
+                        # 再生成時はtemperatureを大幅に下げてJSON形式を厳格化
+                        retry_gen_kwargs = gen_kwargs.copy()
+                        retry_gen_kwargs["temperature"] = 0.3  # 元の temperature (2.0など) から大幅削減
+                        retry_gen_kwargs["top_p"] = 0.8  # top_pも絞る
+                        retry_gen_kwargs["do_sample"] = True  # サンプリングは維持（完全greedyだと同じ出力）
+                        
+                        # 再生成（厳格モード）
                         with torch.no_grad():
                             generated = policy.generate(
                                 **encoded,
-                                **gen_kwargs,
+                                **retry_gen_kwargs,
                             )
                         gen_ids = generated[0, encoded["input_ids"].shape[-1]:]
                         current_raw_resp = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
@@ -2179,8 +2363,13 @@ def main():
                 # すべての試行が失敗した場合のフォールバック
                 plan_text = '{"intervene_now": false}'
                 plan_obj = {"intervene_now": False}
+                json_generation_failed = True  # JSON生成失敗フラグ
                 if getattr(env, "debug", False):
                     print(f"[reward_fn] JSON検証失敗、フォールバック使用 (retry_count={retry_count})")
+            
+            # JSON生成が成功した場合のフラグ
+            if 'json_generation_failed' not in locals():
+                json_generation_failed = False
 
             history_before = [dict(entry) for entry in env.logs]
             state_before = None
@@ -2466,6 +2655,16 @@ def main():
                     "plan_errors": stats["plan_error_count"],
                 }
 
+            # JSON生成に失敗したサンプル（retry_count=3 かつ JSON無効）にペナルティを付与
+            json_failure_penalty = 0.0
+            if retry_count >= 3 and json_generation_failed:
+                json_failure_penalty = getattr(cfg.env, "json_failure_penalty", -1.0)
+                total_reward += json_failure_penalty
+                # breakdownに追加
+                reward_breakdown_formatted["JSON生成失敗"] = json_failure_penalty
+                if getattr(env, "debug", False):
+                    print(f"[reward_fn] JSON生成失敗ペナルティ: {json_failure_penalty} (retry_count={retry_count})")
+            
             rewards.append(total_reward)
 
             # --- バッチ判定: intervention-decision ベース ---
@@ -2685,6 +2884,13 @@ def main():
         return reward_logits, rewards_tensor, sequence_lengths
 
     trl_ppo_trainer.get_reward = _env_get_reward
+    
+    # エントロピーボーナス付きtrain()メソッドを設定（パッチ後のget_rewardを使用）
+    try:
+        PPOTrainerWithEntropyBonus.train = _create_train_method_with_entropy_bonus(get_reward_fn=_env_get_reward)
+        print("[TRAIN_METHOD] Custom train() with entropy bonus applied", flush=True)
+    except Exception as e:
+        print(f"[ERROR] Failed to apply custom train() method: {e}", flush=True)
 
     # TRL 0.23: train() が data["input_ids"] を参照するため
     # collator でトークナイズして渡す
