@@ -117,7 +117,6 @@ class PPOCfg:
     temperature: Optional[float] = None
     top_p: Optional[float] = None
 
-    batch_size: Optional[int] = None
     per_device_train_batch_size: Optional[int] = None
     per_device_eval_batch_size: Optional[int] = None
     ppo_epochs: Optional[int] = None
@@ -125,9 +124,6 @@ class PPOCfg:
     local_rollout_forward_batch_size: Optional[int] = None
     gradient_checkpointing: Optional[bool] = None
     total_updates: Optional[int] = None
-    episode_len: Optional[int] = None
-    missing_eos_penalty: Optional[float] = None
-    non_japanese_penalty: Optional[float] = None
     entropy_floor: Optional[float] = None
     entropy_patience: Optional[int] = None
     entropy_monitor_warmup: Optional[int] = None
@@ -217,7 +213,6 @@ def _validate_required_fields(cfg: AppConfig) -> None:
             "max_new_tokens",
             "temperature",
             "top_p",
-            "batch_size",
             "per_device_train_batch_size",
             "per_device_eval_batch_size",
             "ppo_epochs",
@@ -225,9 +220,6 @@ def _validate_required_fields(cfg: AppConfig) -> None:
             "local_rollout_forward_batch_size",
             "gradient_checkpointing",
             "total_updates",
-            "episode_len",
-            "missing_eos_penalty",
-            "non_japanese_penalty",
             "output_dir",
         ],
     )

@@ -243,9 +243,18 @@ class ConversationEnv:
         # step()と同様に、安定であればmax_auto_skip回まで人間発話を生成
         auto_skip_count = 0
         max_auto_skip = int(getattr(self, "max_auto_skip", 10))
+        initial_conversation_log = []  # 初期会話を記録
 
         if self.debug:
             print(f"  [reset auto_skip] max_auto_skip={max_auto_skip}")
+
+        # 初期会話をログに記録
+        for log_entry in self.logs:
+            if log_entry.get("speaker") != "ロボット":
+                initial_conversation_log.append({
+                    "speaker": log_entry.get("speaker"),
+                    "utterance": log_entry.get("utterance"),
+                })
 
         while auto_skip_count < max_auto_skip:
             # 関係性を評価
@@ -262,20 +271,27 @@ class ConversationEnv:
                     # 不安定なら抜ける
                     if unstable_count > 0:
                         if self.debug:
-                            print(f"  [reset auto_skip] 不安定になったのでループ終了 (unstable_triads={unstable_count})")
+                            print(f"  [reset auto_skip] 不安定になったのでループ終了 (unstable_triads={unstable_count}, auto_skip_count={auto_skip_count})")
                         break
 
                     # 安定なら人間発話を1つ生成
+                    auto_skip_count += 1
                     if self.debug:
-                        print(f"  [reset auto_skip] 安定状態を検出、人間発話を自動生成 ({auto_skip_count + 1}/{max_auto_skip})")
+                        print(f"  [reset auto_skip] 安定状態を検出、人間発話を自動生成 ({auto_skip_count}/{max_auto_skip})")
 
                     replies = human_reply(self.logs, self.persona_pool, topic=self.current_topic, topic_trigger=self.current_topic_trigger, num_speakers=1)
                     if replies:
                         self.logs.extend(replies)
-                        auto_skip_count += 1
+                        # 初期会話ログにも追加
+                        for r in replies:
+                            if r.get("speaker") != "ロボット":
+                                initial_conversation_log.append({
+                                    "speaker": r.get("speaker"),
+                                    "utterance": r.get("utterance"),
+                                })
                     else:
                         if self.debug:
-                            print(f"  [reset auto_skip] 発話生成失敗、スキップ終了")
+                            print(f"  [reset auto_skip] 発話生成失敗、スキップ終了 (auto_skip_count={auto_skip_count})")
                         break
 
                 except Exception as e:
@@ -284,7 +300,12 @@ class ConversationEnv:
                     break
             else:
                 # まだ3発話に達していないので抜ける
+                if self.debug:
+                    print(f"  [reset auto_skip] まだ{self.start_relation_check_after_utterances}発話未満、スキップ終了")
                 break
+
+        # 初期会話ログを保存（step()で参照できるように）
+        self.initial_conversation_log = initial_conversation_log
 
         # max_auto_skip回試しても不安定にならなかった場合は話題を切り替える
         if auto_skip_count >= max_auto_skip:
@@ -425,12 +446,13 @@ class ConversationEnv:
             # 不安定なら抜ける
             if unstable_count > 0:
                 if self.debug:
-                    print(f"  [auto_skip] 不安定になったのでループ終了 (unstable_triads={unstable_count})")
+                    print(f"  [auto_skip] 不安定になったのでループ終了 (unstable_triads={unstable_count}, auto_skip_count={auto_skip_count})")
                 break
 
             # 安定なら人間発話を1つ生成して再評価
+            auto_skip_count += 1
             if self.debug:
-                print(f"  [auto_skip] 安定状態を検出、人間発話を自動生成 ({auto_skip_count + 1}/{max_auto_skip})")
+                print(f"  [auto_skip] 安定状態を検出、人間発話を自動生成 ({auto_skip_count}/{max_auto_skip})")
 
             replies = human_reply(self.logs, self.persona_pool, topic=self.current_topic, topic_trigger=self.current_topic_trigger, num_speakers=1)
             if replies:
@@ -438,7 +460,6 @@ class ConversationEnv:
                 self.logs.extend(replies)
                 # human_replies_before にも追加（info辞書で返すため）
                 human_replies_before.extend(replies)
-                auto_skip_count += 1
 
                 # 関係性を再評価する（update_state=True で永続的に更新）
                 try:
@@ -463,7 +484,7 @@ class ConversationEnv:
             else:
                 # 発話生成に失敗したら抜ける
                 if self.debug:
-                    print(f"  [auto_skip] 発話生成失敗、スキップ終了")
+                    print(f"  [auto_skip] 発話生成失敗、スキップ終了 (auto_skip_count={auto_skip_count})")
                 break
 
         if self.debug:

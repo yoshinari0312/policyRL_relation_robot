@@ -2,7 +2,7 @@
 # - TRL PPO + LoRA (PEFT)
 # - 既存 env.ConversationEnv を 1 ステップ環境として用い、
 #   報酬 = 不安定三角形の減少量 (Before-After) をそのまま使用
-# - 収集: 1 ステップ × batch_size サンプルで1回の PPO 更新#
+# - 収集: 1 ステップ × (per_device_train_batch_size × grad_accum_steps × 2) サンプルで1回の PPO 更新
 # 依存:
 #   pip install "trl>=0.23.0" transformers accelerate peft bitsandbytes datasets
 #
@@ -1076,16 +1076,16 @@ def build_robot_messages(
 - intervene_now は今すぐ介入すべきかを表す。 true|false のいずれか。
 - edge_to_change はどの関係を変更するかを表す。 "AB" | "BC" | "CA" のいずれか。
 - strategy は介入戦略を表す。 "plan" | "validate" | "bridge" のいずれか。
-  - "plan": 「これからどうするか」という未来志向の視点を提示。具体的な次の一歩や小さな行動案を示し、前向きな行動を促す
+  - "plan": 対象者に具体的な行動計画を提案し、関係改善を促進
   - "validate": 対象者の感情・意見を承認し、心理的安全性を構築
   - "bridge": 対立する者の共通点・目標を明示し、協力関係を構築
   ※どの戦略をいつ使うかは会話文脈や関係スコアから判断してください。
 - target_speaker はその介入を誰に向けるかを表す。 edge_to_changeで選んだ人物のいずれか。（"AB"→"A" | "B"、"BC"→"B" | "C"、"CA"→"C" | "A"） 。
 
 出力例(あくまで例です。36通りの組み合わせがあります):
-{"intervene_now": true, "edge_to_change": "AB", "strategy": "validate", "target_speaker": "A"}
-{"intervene_now": true, "edge_to_change": "BC", "strategy": "bridge", "target_speaker": "B"}
-{"intervene_now": true, "edge_to_change": "CA", "strategy": "plan", "target_speaker": "C"}
+{"intervene_now": true, "edge_to_change": "AB", "strategy": "plan", "target_speaker": "A"}
+{"intervene_now": true, "edge_to_change": "BC", "strategy": "validate", "target_speaker": "B"}
+{"intervene_now": true, "edge_to_change": "CA", "strategy": "bridge", "target_speaker": "C"}
 {"intervene_now": false}
 """
 
@@ -2091,18 +2091,24 @@ def main():
             p.requires_grad_(False)
 
     # YAMLでクォートされていると文字列になることがあるので安全にキャスト
-    def _to_int(x, d): 
+    def _to_int(x, d):
         try: return int(x)
         except: return d
     def _to_float(x, d):
         try: return float(x)
         except: return d
 
-    _bs    = _to_int(getattr(ppo_cfg, "batch_size", 8), 8)
-    _mbs   = max(1, _bs // 2)
+    # バッチサイズの計算:
+    # 実効バッチサイズ = per_device_train_batch_size × grad_accum_steps × 2
+    _per_device_bs = _to_int(getattr(ppo_cfg, "per_device_train_batch_size", 1), 1)
     _ga    = _to_int(getattr(ppo_cfg, "grad_accum_steps", 1), 1)
     _epochs= _to_int(getattr(ppo_cfg, "ppo_epochs", 1), 1)  # ←回数を外部（データ件数）で制御するので 1 がラク
     _lr    = _to_float(getattr(ppo_cfg, "lr", 1e-5), 1e-5)
+    
+    # [DEBUG] 設定値をログ出力（バッチサイズ問題の診断用）
+    print(f"[PPO_CONFIG] per_device_train_batch_size (YAML) = {_per_device_bs}")
+    print(f"[PPO_CONFIG] grad_accum_steps (YAML)    = {_ga}")
+    print(f"[PPO_CONFIG] ppo_epochs (YAML)          = {_epochs}")
     _kl    = max(0.0, kl_coef_value)
     _target_kl = max(0.0, _to_float(getattr(ppo_cfg, "target_kl", 0.02), 0.02))
     _kl_adjust_up = _to_float(getattr(ppo_cfg, "kl_adjust_up", 1.3), 1.3)
@@ -2128,8 +2134,6 @@ def main():
     # TRLのバージョンによってはent_coefが存在しない場合があるため、条件付きで設定
     ppo_config_kwargs = {
         "learning_rate": _lr,
-        "batch_size": max(1, _bs),                # 収集するサンプル数/更新
-        "mini_batch_size": max(1, _mbs),          # ミニバッチ
         "gradient_accumulation_steps": max(1, _ga),
         "num_ppo_epochs": _epochs,
         "kl_coef": _kl,
@@ -2160,12 +2164,13 @@ def main():
     # 1 デバイス当たりのバッチサイズ（Accelerate の world size 計算と整合させる）
     ppo_config.per_device_train_batch_size = max(
         1,
-        _to_int(getattr(ppo_cfg, "per_device_train_batch_size", _bs), 1),
+        _to_int(getattr(ppo_cfg, "per_device_train_batch_size", _per_device_bs), 1),
     )
     ppo_config.per_device_eval_batch_size = max(
         1,
         _to_int(getattr(ppo_cfg, "per_device_eval_batch_size", ppo_config.per_device_train_batch_size), 1),
     )
+
 
     # === 3) PPOTrainer 準備（環境ベース報酬を差し込む） ===
     # 会話環境
@@ -2211,16 +2216,18 @@ def main():
     # （当面の起動確認用）ダミーの学習データセット
     _dummy_ds = Dataset.from_dict({"prompt": ["dummy"]})
 
-    # 合計ステップ数＝ total_updates * batch_size に合わせた有限データセットを作る
+    # 合計ステップ数＝ total_updates × effective_batch_size に合わせた有限データセットを作る
+    # effective_batch_size = per_device_train_batch_size × grad_accum_steps × 2
     total_updates = _to_int(getattr(ppo_cfg, "total_updates", 50), 50)
-    total_samples = total_updates * max(1, _bs)
+    effective_batch_size = _per_device_bs * _ga * 2
+    total_samples = total_updates * max(1, effective_batch_size)
     train_ds = FiniteOnlineDataset(
         tokenizer, env, build_robot_messages,
         total_samples=total_samples,
         logger=training_logger,
         interaction_counter=interaction_counter
     )
-    eval_samples = max(1, _bs)
+    eval_samples = max(1, effective_batch_size)
     eval_ds = FiniteOnlineDataset(
         tokenizer, env, build_robot_messages,
         total_samples=eval_samples,
@@ -2262,14 +2269,16 @@ def main():
     entropy_patience_value = max(1, int(getattr(ppo_cfg, "entropy_patience", 1) or 1))
     entropy_monitor_warmup = max(0, int(getattr(ppo_cfg, "entropy_monitor_warmup", 0) or 0))
 
-    # バッチサイズを取得（reward_fn内で参照するため）
-    batch_size = ppo_config.batch_size
+    # 実効バッチサイズ: TRLが実行時に per_device_train_batch_size × grad_accum_steps × 2 で計算する
+    
+    # [CRITICAL] TRLは実行時にこの値を計算するため、Trainer作成後に再取得が必要
+    # 2 * per_device_train_batch_size * grad_accum_steps
 
     # エピソードごとの統計を追跡
     episode_stats: Dict[int, Dict[str, Any]] = {}
 
-    # バッチサマリーコレクターを初期化
-    batch_collector = BatchSummaryCollector(batch_size=batch_size)
+    # バッチサマリーコレクターは後でTrainer作成後に初期化（実効バッチサイズ使用）
+    batch_collector = None  # 一時的にNone、Trainer作成後に初期化
 
     # 報酬関数：生成テキストを環境に流し込み、Before→After のスコア差を返す
     # PPOTrainer 0.23 では `reward_model` 経由の計算が前提のため、後段で monkeypatch して利用する
@@ -2395,7 +2404,7 @@ def main():
                 pass  # 安定チェックに失敗したら通常通り進める
 
             # 選択肢をバッチコレクターに記録
-            if plan_obj:
+            if plan_obj and batch_collector is not None:
                 batch_collector.add_decision(plan_obj)
 
             interaction_id = next(interaction_counter)
@@ -2456,12 +2465,13 @@ def main():
                 episode_stats[current_episode_id]["plan_error_count"] += 1
 
             # バッチコレクターにステップを記録
-            batch_collector.add_step(
-                reward=total_reward,
-                intervened=info.get("intervened", False),
-                is_stable_before=is_stable_before,
-                plan_error=bool(plan_error)
-            )
+            if batch_collector is not None:
+                batch_collector.add_step(
+                    reward=total_reward,
+                    intervened=info.get("intervened", False),
+                    is_stable_before=is_stable_before,
+                    plan_error=bool(plan_error)
+                )
 
             # 会話の流れを整理: 介入前 → 介入 → evaluation_horizon後 → bonus確認後
             log_payload: Dict[str, Any] = {
@@ -2472,8 +2482,8 @@ def main():
                 "retry_count": retry_count,  # 再推論回数を記録
             }
 
-            # ステップ1の場合のみepisode_info（話題・選択された地雷・地雷を持つペルソナ）を追加
-            if env.t == 1:
+            # interaction_id=1（最初のステップ）の場合のみepisode_info（話題・選択された地雷・地雷を持つペルソナ）を追加
+            if interaction_id == 1:
                 episode_info = {}
                 if hasattr(env, "current_topic") and env.current_topic:
                     episode_info["topic"] = env.current_topic
@@ -2507,21 +2517,26 @@ def main():
                 if episode_info:
                     log_payload["episode_info"] = episode_info
 
-            # 1. ステップ1の場合は初期発話を表示、それ以外は何も表示しない
-            if env.t == 1:
+            # 1. interaction_id=1の場合は初期発話を表示、それ以外は何も表示しない
+            if interaction_id == 1:
                 # 初期発話（このステップ開始時まで）
-                initial_utterances = []
-                for log_entry in history_before:
-                    if log_entry.get("speaker") != "ロボット":
-                        initial_utterances.append({
-                            "speaker": log_entry.get("speaker"),
-                            "utterance": log_entry.get("utterance"),
-                        })
-                if initial_utterances:
-                    log_payload["initial_conversation"] = initial_utterances
+                # reset()で記録された初期会話ログを使用
+                if hasattr(env, 'initial_conversation_log') and env.initial_conversation_log:
+                    log_payload["initial_conversation"] = env.initial_conversation_log
+                else:
+                    # フォールバック: logsから抽出
+                    initial_utterances = []
+                    for log_entry in history_before:
+                        if log_entry.get("speaker") != "ロボット":
+                            initial_utterances.append({
+                                "speaker": log_entry.get("speaker"),
+                                "utterance": log_entry.get("utterance"),
+                            })
+                    if initial_utterances:
+                        log_payload["initial_conversation"] = initial_utterances
 
-            # 2. 前のステップで介入していない場合に生成された人間発話（ステップ1は除外）
-            if env.t > 1:
+            # 2. 前のステップで介入していない場合に生成された人間発話（interaction_id=1は除外）
+            if interaction_id > 1:
                 human_utterances_before_rel = info.get("human_utterance_before_relation", [])
 
                 if human_utterances_before_rel:
@@ -2668,7 +2683,7 @@ def main():
             rewards.append(total_reward)
 
             # --- バッチ判定: intervention-decision ベース ---
-            if batch_collector.is_batch_ready():
+            if batch_collector is not None and batch_collector.is_batch_ready():
                 batch_summary = batch_collector.get_summary()
                 training_logger.log_batch_summary(
                     batch_summary=batch_summary,
@@ -2938,6 +2953,16 @@ def main():
         data_collator=ppo_collator,           # ← これが重要
         entropy_coef=_entropy_coef,           # カスタムパラメータ
     )
+
+    # 実効バッチサイズ = per_device_train_batch_size × grad_accum_steps × 2
+    effective_batch_size = ppo_config.per_device_train_batch_size * _ga * 2
+
+    # BatchSummaryCollectorを実効バッチサイズで初期化
+    from app.batch_summary import BatchSummaryCollector
+    batch_collector = BatchSummaryCollector(batch_size=effective_batch_size)
+    print(f"[TRAINER_INIT] BatchSummaryCollector initialized with batch_size={effective_batch_size}")
+    print(f"[TRAINER_INIT]   per_device_train_batch_size={ppo_config.per_device_train_batch_size}")
+    print(f"[TRAINER_INIT]   grad_accum_steps={_ga}")
     
     # デバッグ: Trainer初期化後の状態確認
     print(f"[TRAINER_DEBUG] Trainer initialized", flush=True)
