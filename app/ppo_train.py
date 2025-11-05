@@ -2461,7 +2461,7 @@ def main():
                 "retry_count": retry_count,  # 再推論回数を記録
             }
 
-            # interaction_id=1（最初のステップ）の場合のみepisode_info（話題・選択された地雷・地雷を持つペルソナ）を追加
+            # interaction_id=1（最初のステップ）の場合のみepisode_info（話題・選択された地雷・地雷を持つペルソナ・話者過激度）を追加
             if interaction_id == 1:
                 episode_info = {}
                 if hasattr(env, "current_topic") and env.current_topic:
@@ -2492,6 +2492,14 @@ def main():
                         ]
                         if personas_with_trigger:
                             episode_info["personas_with_trigger"] = personas_with_trigger
+
+                # 話者の過激度を追加
+                if hasattr(env, "speaker_aggressiveness") and env.speaker_aggressiveness:
+                    aggressiveness_info = {
+                        speaker: "過激" if is_aggr else "マイルド"
+                        for speaker, is_aggr in env.speaker_aggressiveness.items()
+                    }
+                    episode_info["speaker_aggressiveness"] = aggressiveness_info
 
                 if episode_info:
                     log_payload["episode_info"] = episode_info

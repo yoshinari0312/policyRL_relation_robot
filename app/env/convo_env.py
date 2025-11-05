@@ -315,6 +315,17 @@ class ConversationEnv:
         self.previous_rel_after_horizon = None
         self.previous_rel_after_bonus = None
 
+        # エピソードごとに各話者の過激度を設定（50%の確率でマイルドまたは過激）
+        import random
+        self.speaker_aggressiveness = {}
+        for speaker in self.persona_pool:
+            self.speaker_aggressiveness[speaker] = random.random() < 0.5  # True=過激, False=マイルド
+        
+        if self.debug:
+            aggr_str = ", ".join([f"{s}: {'過激' if is_aggr else 'マイルド'}" 
+                                   for s, is_aggr in self.speaker_aggressiveness.items()])
+            print(f"[reset] Episode {self.episode} 話者過激度設定: {aggr_str}")
+
         # トピックを生成
         self.current_topic = self._get_topic_suggestion()
         self.used_topics.append(self.current_topic)
@@ -362,7 +373,7 @@ class ConversationEnv:
                     if self.debug:
                         print(f"  [reset auto_skip] 安定状態を検出、人間発話を自動生成 ({auto_skip_count}/{max_auto_skip})")
 
-                    replies = human_reply(self.logs, self.persona_pool, topic=self.current_topic, topic_trigger=self.current_topic_trigger, num_speakers=1)
+                    replies = human_reply(self.logs, self.persona_pool, topic=self.current_topic, topic_trigger=self.current_topic_trigger, num_speakers=1, speaker_aggressiveness=self.speaker_aggressiveness)
                     if replies:
                         self.logs.extend(replies)
                         # 初期会話ログにも追加
@@ -462,7 +473,7 @@ class ConversationEnv:
                     print(f"  ステップ1: reset()で既に{len(self.logs)}発話生成済み")
         else:
             # 人間1発話生成
-            replies = human_reply(self.logs, self.persona_pool, topic=self.current_topic, topic_trigger=self.current_topic_trigger, num_speakers=1)
+            replies = human_reply(self.logs, self.persona_pool, topic=self.current_topic, topic_trigger=self.current_topic_trigger, num_speakers=1, speaker_aggressiveness=self.speaker_aggressiveness)
             if replies:
                 self.logs.extend(replies)
                 human_replies_before = replies  # 生成した人間発話を保存
@@ -537,7 +548,7 @@ class ConversationEnv:
             if self.debug:
                 print(f"  [auto_skip] 安定状態を検出、人間発話を自動生成 ({auto_skip_count}/{max_auto_skip})")
 
-            replies = human_reply(self.logs, self.persona_pool, topic=self.current_topic, topic_trigger=self.current_topic_trigger, num_speakers=1)
+            replies = human_reply(self.logs, self.persona_pool, topic=self.current_topic, topic_trigger=self.current_topic_trigger, num_speakers=1, speaker_aggressiveness=self.speaker_aggressiveness)
             if replies:
                 # 安定時に生成された発話を self.logs に追加（実環境の会話履歴として保存）
                 self.logs.extend(replies)
@@ -1410,7 +1421,7 @@ class ConversationEnv:
         safety_limit = max(1, self.max_steps * max(1, len(self.persona_pool)) * 3)
         while turns_added < target_turns and turns_added < safety_limit:
             # 1人間発話ずつ生成
-            replies = human_reply(self.logs, self.persona_pool, topic=self.current_topic, topic_trigger=self.current_topic_trigger, num_speakers=1)
+            replies = human_reply(self.logs, self.persona_pool, topic=self.current_topic, topic_trigger=self.current_topic_trigger, num_speakers=1, speaker_aggressiveness=self.speaker_aggressiveness)
             if not replies:
                 break
             self.logs.extend(replies)
@@ -1581,7 +1592,7 @@ class ConversationEnv:
         safety_limit = max(1, self.max_steps * max(1, len(self.persona_pool)))
         while turns_added < human_turns and turns_added < safety_limit:
             # 1人間発話ずつ生成
-            replies = human_reply(logs, self.persona_pool, topic=self.current_topic, topic_trigger=self.current_topic_trigger, num_speakers=1)
+            replies = human_reply(logs, self.persona_pool, topic=self.current_topic, topic_trigger=self.current_topic_trigger, num_speakers=1, speaker_aggressiveness=self.speaker_aggressiveness)
             if not replies:
                 break
             logs.extend(replies)

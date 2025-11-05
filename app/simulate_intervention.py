@@ -232,10 +232,11 @@ class InterventionSimulator:
 あなたの目的は、このターゲットが含まれる関係（エッジ）をより安定(+)に近づけるために、「今この瞬間にどの戦略を選ぶことが最も効果的か」を判断することです。
 
 戦略の選択肢：
-1. validate — 対象者の感情や意見を承認し、心理的安全性を構築する。
-2. bridge — 対立する相手との共通点や協力の軸を見つけ、関係を再接続する。
-3. plan — 対象者に次の行動や方針を示し、前向きな関係改善を促す。
 4. no_intervention — 対立が軽度で、介入が逆効果になりそうなときや自然回復が見込める時に選ぶ。
+3. plan — 対象者に次の行動や方針を示し、前向きな関係改善を促す。
+2. bridge — 対立する相手との共通点や協力の軸を見つけ、関係を再接続する。
+1. validate — 対象者の感情や意見を承認し、心理的安全性を構築する。
+
 
 出力形式：
 - 数字1桁と理由のみを出力してください（1, 2, 3, 4）
@@ -244,10 +245,10 @@ class InterventionSimulator:
 - 与えられた入力情報に基づいて選択してください。
 
 出力例
-1,理由：〜
-2,理由：〜
-3,理由：〜
 4,理由：〜
+3,理由：〜
+2,理由：〜
+1,理由：〜
 """
         
         # Qwen3モデルの場合のみ、\no_thinkを追加
@@ -324,7 +325,16 @@ class InterventionSimulator:
         observation = self.env.reset()
 
         print(f"\n📌 話題: {self.env.current_topic}")
-        print(f"👥 ペルソナ: {', '.join(self.env.persona_pool)}")
+        
+        # 話者の過激度を表示
+        if hasattr(self.env, "speaker_aggressiveness") and self.env.speaker_aggressiveness:
+            aggr_list = []
+            for speaker in self.env.persona_pool:
+                is_aggr = self.env.speaker_aggressiveness.get(speaker, False)
+                level = "過激" if is_aggr else "マイルド"
+                emoji = "🔥" if is_aggr else "😌"
+                aggr_list.append(f"{speaker}: {level}{emoji}")
+            print(f"💢 話者過激度: {', '.join(aggr_list)}")
 
         # 初期会話履歴を表示（介入判定LLM用のintervention_max_history発話）
         print(f"\n💬 初期会話履歴（reset()で生成、ステップ1の入力）:")

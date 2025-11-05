@@ -81,7 +81,7 @@ def _post_ollama(prompt: str, base: str) -> str:
     return result
 
 
-def build_human_prompt(speaker: str, logs: List[Dict], topic: str = None, topic_trigger: str = None) -> str:
+def build_human_prompt(speaker: str, logs: List[Dict], topic: str = None, topic_trigger: str = None, is_aggressive: bool = None) -> str:
     """Construct a neutral conversation prompt for the given speaker.
 
     Args:
@@ -89,6 +89,7 @@ def build_human_prompt(speaker: str, logs: List[Dict], topic: str = None, topic_
         logs: 会話履歴
         topic: 会話のトピック
         topic_trigger: トピックの元になった地雷（この地雷だけを使用）
+        is_aggressive: 話者の過激度（True=過激, False=マイルド, None=ランダム）
     """
     # max_history_human個の人間発話 + その間のロボット発話を取得
     cfg = get_config()
@@ -162,9 +163,10 @@ def build_human_prompt(speaker: str, logs: List[Dict], topic: str = None, topic_
         other_speakers = [s for s in all_triggers.keys() if s != speaker]
         other_names = "、".join(other_speakers) if other_speakers else "他の参加者"
 
-        # 過激度を確率で切り替え（50%でマイルド、50%で過激）
-        import random
-        is_aggressive = random.random() < 0.5
+        # 過激度が指定されていない場合はランダムに決定（後方互換性）
+        if is_aggressive is None:
+            import random
+            is_aggressive = random.random() < 0.5
 
         # 案2: 共通地雷の場合の特別処理
         # topic_triggerが指定されていて、自分も持っている場合
@@ -261,7 +263,7 @@ def build_human_prompt(speaker: str, logs: List[Dict], topic: str = None, topic_
     ])
     return "\n".join(lines)
 
-def human_reply(logs: List[Dict], personas: List[str], topic: str = None, topic_trigger: str = None, num_speakers: Optional[int] = None) -> List[Dict]:
+def human_reply(logs: List[Dict], personas: List[str], topic: str = None, topic_trigger: str = None, num_speakers: Optional[int] = None, speaker_aggressiveness: Optional[Dict[str, bool]] = None) -> List[Dict]:
     """会話参加者それぞれの応答を生成する。
 
     Args:
@@ -270,6 +272,7 @@ def human_reply(logs: List[Dict], personas: List[str], topic: str = None, topic_
         topic: 会話のトピック
         topic_trigger: トピックの元になった地雷（この地雷だけを使用）
         num_speakers: 生成する発話数（Noneの場合は全員分、1の場合は1人間発話のみ）
+        speaker_aggressiveness: 各話者の過激度 {speaker: is_aggressive}（True=過激, False=マイルド）
     """
 
     replies = []
@@ -318,12 +321,15 @@ def human_reply(logs: List[Dict], personas: List[str], topic: str = None, topic_
         prompt_logs = working_logs
         text = ""
 
+        # 話者の過激度を取得（指定されていない場合はNone→ランダム）
+        is_aggressive = speaker_aggressiveness.get(speaker) if speaker_aggressiveness else None
+
         if provider == "azure":
             client, deployment = get_azure_chat_completion_client(getattr(_CFG, "llm", None), model_type="human")
             max_attempts = getattr(_CFG.llm, "max_attempts", 5) or 5
             base_backoff = getattr(_CFG.llm, "base_backoff", 0.5) or 0.5
             if client and deployment:
-                persona_prompt = build_human_prompt(speaker, prompt_logs, topic=topic, topic_trigger=topic_trigger)
+                persona_prompt = build_human_prompt(speaker, prompt_logs, topic=topic, topic_trigger=topic_trigger, is_aggressive=is_aggressive)
                 messages = [
                     {
                         "role": "system",
@@ -363,7 +369,7 @@ def human_reply(logs: List[Dict], personas: List[str], topic: str = None, topic_
             base = _BASES[idx % len(_BASES)]
             for attempt in range(1, max_attempts + 1):
                 try:
-                    candidate = _post_ollama(build_human_prompt(speaker, prompt_logs, topic=topic, topic_trigger=topic_trigger), base=base)
+                    candidate = _post_ollama(build_human_prompt(speaker, prompt_logs, topic=topic, topic_trigger=topic_trigger, is_aggressive=is_aggressive), base=base)
                 except Exception as e:
                     if _CFG.env.debug:
                         print(f"[human_reply] Ollama call error for {speaker}: {e}")
