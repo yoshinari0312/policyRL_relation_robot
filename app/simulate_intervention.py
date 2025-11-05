@@ -2,15 +2,15 @@
 """
 複数モデルを使った介入判定シミュレーション
 
-GPT5（Azure OpenAI）またはQwen3の学習前モデルで介入判定した時の
+GPT5（Azure OpenAI）またはローカルの学習前モデルで介入判定した時の
 報酬や会話の様子を確認するシミュレーションスクリプト。
 
 使用方法:
     # GPT5を使用
     python simulate_intervention.py --model gpt5 --num-sessions 5
     
-    # Qwen3学習前モデルを使用
-    python simulate_intervention.py --model qwen3 --num-sessions 5
+    # Qwen3などのローカルモデルの学習前モデルを使用
+    python simulate_intervention.py --model local --num-sessions 5
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ class InterventionSimulator:
     ):
         """
         Args:
-            model_type: 使用するモデル ("gpt5" または "qwen3")
+            model_type: 使用するモデル ("gpt5" または "local")
             max_steps: 1エピソードあたりの最大ステップ数
             num_sessions: シミュレートするセッション数
             verbose: 詳細な出力を行うかどうか
@@ -54,8 +54,8 @@ class InterventionSimulator:
         # モデルタイプに応じてクライアントを初期化
         if self.model_type == "gpt5":
             self._init_gpt5_client(cfg)
-        elif self.model_type == "qwen3":
-            self._init_qwen3_client(cfg)
+        elif self.model_type == "local":
+            self._init_local_client(cfg)
         else:
             raise ValueError(f"サポートされていないモデルタイプ: {self.model_type}")
 
@@ -91,32 +91,32 @@ class InterventionSimulator:
             raise RuntimeError("Azure OpenAI client could not be initialized")
         print(f"✓ GPT5クライアント初期化完了 (deployment: {self.deployment})")
 
-    def _init_qwen3_client(self, cfg):
-        """Qwen3学習前モデルクライアントを初期化"""
+    def _init_local_client(self, cfg):
+        """ローカル学習前モデルクライアントを初期化"""
         try:
             from transformers import AutoTokenizer, AutoModelForCausalLM
             import torch
         except ImportError:
             raise RuntimeError("transformersライブラリが必要です: pip install transformers torch")
 
-        # Qwen3モデルのパスを取得（configから）
+        # ローカルモデルのパスを取得（configから）
         ppo_cfg = getattr(cfg, "ppo", None)
         if not ppo_cfg:
             raise RuntimeError("config.ppo が見つかりません")
         
-        model_path = getattr(ppo_cfg, "model_name_or_path", None)
-        if not model_path:
+        self.model_name_or_path = getattr(ppo_cfg, "model_name_or_path", None)
+        if not self.model_name_or_path:
             raise RuntimeError("config.ppo.model_name_or_path が設定されていません")
 
-        print(f"🔄 Qwen3モデルをロード中: {model_path}")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        print(f"🔄 モデルをロード中: {self.model_name_or_path}")
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name_or_path)
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_path,
+            self.model_name_or_path,
             torch_dtype=torch.bfloat16,
             device_map="auto",
         )
         self.model.eval()
-        print(f"✓ Qwen3モデルロード完了")
+        print(f"✓ モデルロード完了: {self.model_name_or_path}")
 
     def get_intervention_decision(self, observation: str) -> str:
         """
@@ -126,46 +126,41 @@ class InterventionSimulator:
             observation: 環境からの観測（プロンプト）
 
         Returns:
-            介入判定のJSON文字列
+            介入判定の数字文字列（1-4）または後方互換性のためのJSON文字列
         """
         if self.model_type == "gpt5":
             return self._get_gpt5_decision(observation)
-        elif self.model_type == "qwen3":
-            return self._get_qwen3_decision(observation)
+        elif self.model_type == "local":
+            return self._get_local_decision(observation)
         else:
-            return '{"intervene_now": false}'
+            return '4'  # デフォルトは介入しない
 
     def _get_gpt5_decision(self, observation: str) -> str:
         """GPT5で介入判定を行う"""
-        # プロンプト最適化: 固定説明をシステムプロンプトに集約
-        system_content = """あなたは関係性を安定させるロボットの介入計画を提案するAIです。
+        # プロンプト最適化: 新しい数字形式
+        system_content = """
+あなたは、会話が不安定になっているときに、ロボットがどのように介入すれば関係を安定化できるかを判断するアシスタントです。
+会話は三者（A, B, C）の間で行われており、一時的な対立や不調和が生じています。
 
-三者会話（話者 A/B/C）の関係を安定化するため、ロボットが適切なタイミングで一言介入します。
-あなたの役割は、会話履歴と各ペアの関係スコア（-1..1）を受け取り、
-「できるだけ早く関係性を安定状態（+++,+--,-+-,--+）にする」ための介入方法を提案することです。
-※ロボットの実際の発話文は別LLMが生成します。あなたは介入方法だけを出力します。
+入力として、
+- 三者の会話文脈
+- 各ペア（AB, BC, CA）の関係スコア（-1〜1）
+- 今回の介入対象者（ターゲット）
+- その対象関係ペア（エッジ）
+が与えられます。
 
-制約:
-- 出力は JSON のみ。説明や装飾は禁止。
-- intervene_now は今すぐ介入すべきかを表す。 true|false のいずれか。
-- edge_to_change はどの関係を変更するかを表す。 "AB" | "BC" | "CA" のいずれか。
-- strategy は介入戦略を表す。 "plan" | "validate" | "bridge" のいずれか。
-  - "plan": 「これからどうするか」という未来志向の視点を提示。具体的な次の一歩や小さな行動案を示し、前向きな行動を促す
-  - "validate": 対象者の感情・意見を承認し、心理的安全性を構築
-  - "bridge": 対立する者の共通点・目標を明示し、協力関係を構築
-  ※どの戦略をいつ使うかは会話文脈や関係スコアから判断してください。
-- target_speaker はその介入を誰に向けるかを表す。 edge_to_changeで選んだ人物のいずれか。（"AB"→"A" | "B"、"BC"→"B" | "C"、"CA"→"C" | "A"） 。
+あなたの目的は、このターゲットが含まれる関係（エッジ）を安定化状態（+++、+--、-+-、--+）へ近づけるために、最も効果的な介入戦略を選択することです。
 
-出力例(あくまで例です。36通りの組み合わせがあります):
-{"intervene_now": true, "edge_to_change": "AB", "strategy": "validate", "target_speaker": "A"}
-{"intervene_now": true, "edge_to_change": "BC", "strategy": "bridge", "target_speaker": "B"}
-{"intervene_now": true, "edge_to_change": "CA", "strategy": "plan", "target_speaker": "C"}
-{"intervene_now": false}
-"""
+戦略の選択肢：
+1. validate — 対象者の感情や意見を承認し、心理的安全性を構築する。
+2. bridge — 対立する相手との共通点や協力の軸を見つけ、関係を再接続する。
+3. plan — 対象者に次の行動や方針を示し、前向きな関係改善を促す。
+4. no_intervention — まだ介入のタイミングではなく、自然な回復を見守る。
 
-    user_content = f"""
-会話履歴:
-{history_text}
+出力形式：
+- 数字1桁のみを出力してください（1, 2, 3, または 4）
+- 説明や補足は一切不要です。
+- 与えられた会話文脈・関係スコア・ターゲット情報に基づいて選択してください。
 """
 
         messages = [
@@ -198,34 +193,13 @@ class InterventionSimulator:
                             print(content)
                             print("-" * 80)
                         
-                        # JSON部分を抽出
+                        # 数字を抽出（1-4のいずれか）
                         content = content.strip()
                         
-                        # <think>タグを除去
-                        if "<think>" in content:
-                            # </think>の後から取得
-                            think_end = content.find("</think>")
-                            if think_end != -1:
-                                content = content[think_end + 8:].strip()
-                        
-                        # コードブロックから抽出
-                        if "```json" in content:
-                            start = content.find("```json") + 7
-                            end = content.find("```", start)
-                            if end > start:
-                                content = content[start:end].strip()
-                        elif "```" in content:
-                            start = content.find("```") + 3
-                            end = content.find("```", start)
-                            if end > start:
-                                content = content[start:end].strip()
-                        
-                        # JSONオブジェクトを直接抽出（{...}）
-                        if "{" in content and "}" in content:
-                            start = content.find("{")
-                            end = content.rfind("}") + 1
-                            if end > start:
-                                content = content[start:end].strip()
+                        # 数字のみを探す
+                        for char in content:
+                            if char in '1234':
+                                return char
 
                         return content
             except Exception as e:
@@ -235,42 +209,52 @@ class InterventionSimulator:
                     time.sleep(0.5 * attempt)
 
         # フォールバック: 介入しない判定を返す
-        return '{"intervene_now": false}'
+        return '4'
 
-    def _get_qwen3_decision(self, observation: str) -> str:
-        """Qwen3学習前モデルで介入判定を行う"""
+    def _get_local_decision(self, observation: str) -> str:
+        """ローカルモデル（Qwen3など）で介入判定を行う"""
         import torch
         
-        # プロンプト最適化: 固定説明をシステムプロンプトに集約
-        system_content = """あなたは関係性を安定させるロボットの介入計画を提案するAIです。
+        # プロンプト最適化: 新しい数字形式
+        system_content = """
+あなたは、会話が一時的に不安定になっている場面で、ロボットがどのような介入を行えば、または行わないことで、最も良い結果（関係の安定化）を導けるかを判断します。
+会話には感情のズレや対立が含まれていますが、状況によっては人間同士が自然に回復することもあります。
+したがって、必ずしもロボットが発言する必要はありません。
+会話は三者（A, B, C）の間で行われており、一時的な対立や不調和が生じています。
 
-三者会話（話者 A/B/C）の関係を安定化するため、ロボットが適切なタイミングで一言介入します。
-あなたの役割は、会話履歴と各ペアの関係スコア（-1..1）を受け取り、
-「できるだけ早く関係性を安定状態（+++,+--,-+-,--+）にする」ための介入方法を提案することです。
-※ロボットの実際の発話文は別LLMが生成します。あなたは介入方法だけを出力します。
+入力として、
+- 三者の会話文脈
+- 各ペア（AB, BC, CA）の関係スコア（-1〜1）
+- 今回の介入対象者（ターゲット）
+- その対象関係ペア（エッジ）
+が与えられます。
 
-制約:
-- 出力は JSON のみ。説明や装飾は禁止。
-- intervene_now は今すぐ介入すべきかを表す。 true|false のいずれか。
-- edge_to_change はどの関係を変更するかを表す。 "AB" | "BC" | "CA" のいずれか。
-- strategy は介入戦略を表す。 "plan" | "validate" | "bridge" のいずれか。
-  - "plan": 「これからどうするか」という未来志向の視点を提示。具体的な次の一歩や小さな行動案を示し、前向きな行動を促す
-  - "validate": 対象者の感情・意見を承認し、心理的安全性を構築
-  - "bridge": 対立する者の共通点・目標を明示し、協力関係を構築
-  ※どの戦略をいつ使うかは会話文脈や関係スコアから判断してください。
-- target_speaker はその介入を誰に向けるかを表す。 edge_to_changeで選んだ人物のいずれか。（"AB"→"A" | "B"、"BC"→"B" | "C"、"CA"→"C" | "A"） 。
+あなたの目的は、このターゲットが含まれる関係（エッジ）をより安定(+)に近づけるために、「今この瞬間にどの戦略を選ぶことが最も効果的か」を判断することです。
 
-出力例(あくまで例です。36通りの組み合わせがあります):
-{"intervene_now": true, "edge_to_change": "AB", "strategy": "validate", "target_speaker": "A"}
-{"intervene_now": true, "edge_to_change": "BC", "strategy": "bridge", "target_speaker": "B"}
-{"intervene_now": true, "edge_to_change": "CA", "strategy": "plan", "target_speaker": "C"}
-{"intervene_now": false}
+戦略の選択肢：
+1. validate — 対象者の感情や意見を承認し、心理的安全性を構築する。
+2. bridge — 対立する相手との共通点や協力の軸を見つけ、関係を再接続する。
+3. plan — 対象者に次の行動や方針を示し、前向きな関係改善を促す。
+4. no_intervention — 対立が軽度で、介入が逆効果になりそうなときや自然回復が見込める時に選ぶ。
+
+出力形式：
+- 数字1桁と理由のみを出力してください（1, 2, 3, 4）
+- 理由は文脈に沿ったものとしてください
+- 説明や補足は一切不要です。
+- 与えられた入力情報に基づいて選択してください。
+
+出力例
+1,理由：〜
+2,理由：〜
+3,理由：〜
+4,理由：〜
 """
         
-        # Qwen3モデルの場合、\no_thinkを追加
-        system_content = "\\no_think\n" + system_content
+        # Qwen3モデルの場合のみ、\no_thinkを追加
+        if hasattr(self, 'model_name_or_path') and self.model_name_or_path and "Qwen3" in self.model_name_or_path:
+            system_content = "\\no_think\n" + system_content
         
-        # Qwen3のチャットテンプレートを使用
+        # モデルのチャットテンプレートを使用
         messages = [
             {"role": "system", "content": system_content},
             {"role": "user", "content": observation}
@@ -288,7 +272,7 @@ class InterventionSimulator:
             with torch.no_grad():
                 generated_ids = self.model.generate(
                     **model_inputs,
-                    max_new_tokens=512,
+                    max_new_tokens=256,
                     do_sample=True,
                     temperature=0.7,
                     top_p=0.95,
@@ -302,46 +286,25 @@ class InterventionSimulator:
             
             # 生の出力をターミナルに表示
             if self.verbose:
-                print(f"\n🤖 Qwen3生出力:")
+                print(f"\n🤖 モデル生出力:")
                 print("-" * 80)
                 print(response)
                 print("-" * 80)
             
-            # JSON部分を抽出
+            # 数字を抽出（1-4のいずれか）
             response = response.strip()
             
-            # <think>タグを除去
-            if "<think>" in response:
-                # </think>の後から取得
-                think_end = response.find("</think>")
-                if think_end != -1:
-                    response = response[think_end + 8:].strip()
-            
-            # コードブロックから抽出
-            if "```json" in response:
-                start = response.find("```json") + 7
-                end = response.find("```", start)
-                if end > start:
-                    response = response[start:end].strip()
-            elif "```" in response:
-                start = response.find("```") + 3
-                end = response.find("```", start)
-                if end > start:
-                    response = response[start:end].strip()
-            
-            # JSONオブジェクトを直接抽出（{...}）
-            if "{" in response and "}" in response:
-                start = response.find("{")
-                end = response.rfind("}") + 1
-                if end > start:
-                    response = response[start:end].strip()
+            # 数字のみを探す
+            for char in response:
+                if char in '1234':
+                    return char
             
             return response
             
         except Exception as e:
             if self.verbose:
-                print(f"[Qwen3] 介入判定失敗: {e}")
-            return '{"intervene_now": false}'
+                print(f"[ローカル] 介入判定失敗: {e}")
+            return '4'
 
     def run_session(self, session_id: int) -> Dict[str, Any]:
         """
@@ -411,6 +374,16 @@ class InterventionSimulator:
         interventions = 0
         steps_taken = 0
         conversation_log: List[Dict[str, Any]] = []
+        
+        # 介入戦略の統計
+        strategy_counts = {
+            'validate': 0,
+            'bridge': 0,
+            'plan': 0,
+            'no_intervention': 0
+        }
+        llm_inference_count = 0  # LLMで推論した回数（安定状態を除く）
+        stable_skip_count = 0     # 安定状態でスキップした回数
 
         # 前ステップの最終関係性をキャッシュ（初期状態用）
         previous_step_rel = None
@@ -469,8 +442,13 @@ class InterventionSimulator:
 
             # 安定状態の場合は介入判定をスキップ
             if is_stable_now:
-                action = '{"intervene_now": false}'
+                stable_skip_count += 1
+                if self.verbose:
+                    print(f"\n⏭️  安定状態のため介入判定をスキップ")
             else:
+                # LLMで推論を実行
+                llm_inference_count += 1
+                
                 # 観測プロンプトを表示
                 if self.verbose:
                     print(f"\n📝 観測情報（{self.model_type.upper()}への入力）:")
@@ -494,27 +472,51 @@ class InterventionSimulator:
                         score_line = [line for line in observation.split("\n") if "現在の関係スコア" in line]
                         if score_line:
                             print(f"  {score_line[0]}")
+                    if "エッジ" in observation:
+                        edge_line = [line for line in observation.split("\n") if "エッジ" in line]
+                        if edge_line:
+                            print(f"  {edge_line[0]}")
+                    if "ターゲット" in observation:
+                        target_line = [line for line in observation.split("\n") if "ターゲット" in line]
+                        if target_line:
+                            print(f"  {target_line[0]}")
                     print("-" * 80)
 
                 # モデルで介入判定
                 action = self.get_intervention_decision(observation)
+                
+                # 戦略をカウント
+                strategy_map = {
+                    '1': 'validate',
+                    '2': 'bridge',
+                    '3': 'plan',
+                    '4': 'no_intervention'
+                }
+                strategy = strategy_map.get(action.strip(), 'no_intervention')
+                if strategy in strategy_counts:
+                    strategy_counts[strategy] += 1
 
             # 介入判定結果を表示（安定状態の場合はスキップ）
             if self.verbose and not is_stable_now:
                 print(f"\n🤖 {self.model_type.upper()}介入判定結果:")
-                try:
-                    action_json = json.loads(action)
-                    intervene_now = action_json.get('intervene_now', False)
-                    print(f"  介入判定: {'✅ 介入する' if intervene_now else '❌ 介入しない'}")
-                    if intervene_now:
-                        print(f"  対象エッジ: {action_json.get('edge_to_change', 'N/A')}")
-                        print(f"  戦略: {action_json.get('strategy', 'N/A')}")
-                        print(f"  対象話者: {action_json.get('target_speaker', 'N/A')}")
-                        if action_json.get('reasoning'):
-                            print(f"  理由: {action_json['reasoning']}")
-                        print(f"\n  ➡️  この判定に基づき、step()内でロボット発話が生成されます")
-                except json.JSONDecodeError:
-                    print(f"  ⚠️ JSON解析失敗: {action[:100]}...")
+                # 数字形式（1-4）で出力される
+                strategy_map = {
+                    '1': 'validate',
+                    '2': 'bridge',
+                    '3': 'plan',
+                    '4': 'no_intervention'
+                }
+                strategy = strategy_map.get(action.strip(), 'unknown')
+                
+                if strategy == 'no_intervention':
+                    print(f"  介入判定: ❌ 介入しない (4)")
+                elif strategy != 'unknown':
+                    print(f"  介入判定: ✅ 介入する")
+                    print(f"  戦略: {strategy} ({action.strip()})")
+                    print(f"\n  ➡️  この判定に基づき、step()内でロボット発話が生成されます")
+                    print(f"      edge_to_change と target_speaker は環境側で自動決定されます")
+                else:
+                    print(f"  ⚠️ 不明な出力: {action}")
 
             # 環境でステップ実行
             print(f"\n⚙️  環境step()を実行中...")
@@ -692,14 +694,28 @@ class InterventionSimulator:
         print(f"セッション {session_id} 終了")
         print("=" * 80)
         print(f"総ステップ数: {steps_taken}")
-        print(f"総介入回数: {interventions}")
+        print(f"総介入回数: {llm_inference_count} (安定状態スキップ: {stable_skip_count}回)")
         print(f"総報酬: {total_reward:.4f}")
         print(f"平均ステップ報酬: {total_reward / steps_taken if steps_taken > 0 else 0:.4f}")
+        
+        # 戦略使用統計
+        print(f"\n介入戦略の使用回数:")
+        print(f"  validate: {strategy_counts['validate']}回")
+        print(f"  bridge: {strategy_counts['bridge']}回")
+        print(f"  plan: {strategy_counts['plan']}回")
+        print(f"  no_intervention: {strategy_counts['no_intervention']}回")
 
         return {
             "session_id": session_id,
             "topic": self.env.current_topic,
             "total_reward": total_reward,
+            "interventions": interventions,
+            "steps": steps_taken,
+            "average_reward": total_reward / steps_taken if steps_taken > 0 else 0,
+            "conversation_log": conversation_log,
+            "llm_inference_count": llm_inference_count,
+            "stable_skip_count": stable_skip_count,
+            "strategy_counts": strategy_counts,
             "interventions": interventions,
             "steps": steps_taken,
             "average_reward": total_reward / steps_taken if steps_taken > 0 else 0,
@@ -740,11 +756,25 @@ class InterventionSimulator:
         total_rewards = [s["total_reward"] for s in self.session_stats]
         total_interventions = sum(s["interventions"] for s in self.session_stats)
         total_steps = sum(s["steps"] for s in self.session_stats)
+        total_llm_inferences = sum(s["llm_inference_count"] for s in self.session_stats)
+        total_stable_skips = sum(s["stable_skip_count"] for s in self.session_stats)
+        
+        # 戦略統計を集計
+        total_strategy_counts = {
+            'validate': 0,
+            'bridge': 0,
+            'plan': 0,
+            'no_intervention': 0
+        }
+        for stat in self.session_stats:
+            for strategy, count in stat["strategy_counts"].items():
+                total_strategy_counts[strategy] += count
 
         print(f"使用モデル: {self.model_type.upper()}")
         print(f"総セッション数: {len(self.session_stats)}")
         print(f"総ステップ数: {total_steps}")
-        print(f"総介入回数: {total_interventions}")
+        print(f"総介入回数: {total_llm_inferences} (安定状態でスキップ: {total_stable_skips}回)")
+        print(f"  ※安定状態の場合は介入判定LLMを呼び出さずにスキップします")
         print(f"総実行時間: {elapsed_time:.2f}秒")
         print()
         print(f"総報酬:")
@@ -753,8 +783,15 @@ class InterventionSimulator:
         print(f"  最大: {max(total_rewards):.4f}")
         print(f"  最小: {min(total_rewards):.4f}")
         print()
+        print(f"介入戦略の使用統計:")
+        print(f"  validate: {total_strategy_counts['validate']}回 ({total_strategy_counts['validate']/max(total_llm_inferences,1)*100:.1f}%)")
+        print(f"  bridge: {total_strategy_counts['bridge']}回 ({total_strategy_counts['bridge']/max(total_llm_inferences,1)*100:.1f}%)")
+        print(f"  plan: {total_strategy_counts['plan']}回 ({total_strategy_counts['plan']/max(total_llm_inferences,1)*100:.1f}%)")
+        print(f"  no_intervention: {total_strategy_counts['no_intervention']}回 ({total_strategy_counts['no_intervention']/max(total_llm_inferences,1)*100:.1f}%)")
+        print()
         print(f"セッションごとの平均介入回数: {total_interventions / len(self.session_stats):.2f}")
         print(f"セッションごとの平均ステップ数: {total_steps / len(self.session_stats):.2f}")
+        print(f"セッションごとの平均介入回数: {total_llm_inferences / len(self.session_stats):.2f}")
 
         # セッションごとの詳細
         print("\n" + "-" * 80)
@@ -764,8 +801,18 @@ class InterventionSimulator:
             print(f"セッション {stat['session_id']}:")
             print(f"  話題: {stat['topic']}")
             print(f"  総報酬: {stat['total_reward']:.4f}")
-            print(f"  介入回数: {stat['interventions']}")
             print(f"  ステップ数: {stat['steps']}")
+            print(f"  介入回数: {stat['llm_inference_count']} (安定スキップ: {stat['stable_skip_count']}回)")
+            
+            # 戦略使用統計
+            strategy_counts = stat['strategy_counts']
+            total_inferences = stat['llm_inference_count']
+            if total_inferences > 0:
+                print(f"  戦略使用:")
+                print(f"    validate: {strategy_counts['validate']}回 ({strategy_counts['validate']/total_inferences*100:.1f}%)")
+                print(f"    bridge: {strategy_counts['bridge']}回 ({strategy_counts['bridge']/total_inferences*100:.1f}%)")
+                print(f"    plan: {strategy_counts['plan']}回 ({strategy_counts['plan']/total_inferences*100:.1f}%)")
+                print(f"    no_intervention: {strategy_counts['no_intervention']}回 ({strategy_counts['no_intervention']/total_inferences*100:.1f}%)")
             print()
 
 
@@ -776,7 +823,7 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        choices=["gpt5", "qwen3"],
+        choices=["gpt5", "local"],
         default="gpt5",
         help="使用するモデル (デフォルト: gpt5)",
     )

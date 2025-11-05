@@ -78,14 +78,30 @@ class GPT5InterventionSimulator:
             observation: 環境からの観測（プロンプト）
 
         Returns:
-            介入判定のJSON文字列
+            介入判定の数字文字列（1-4）
         """
-        # GPT5に介入判定を依頼
+        # GPT5に介入判定を依頼（新しい数字形式）
         messages = [
             {
                 "role": "system",
-                "content": "あなたは会話の関係性を安定化するためのロボット介入プランナーです。"
-                "指示に従って、JSON形式で介入計画を出力してください。"
+                "content": """あなたは関係性を安定させるロボットの介入計画を提案するAIです。
+
+三者会話（話者 A/B/C）の関係を安定化するため、ロボットが適切なタイミングで一言介入します。
+あなたの役割は、会話履歴と各ペアの関係スコア（-1..1）を受け取り、
+「できるだけ早く関係性を安定状態（+++,+--,-+-,--+）にする」ための介入戦略を選択することです。
+※ロボットの実際の発話文は別LLMが生成します。あなたは戦略の番号だけを出力します。
+
+戦略の選択肢:
+1. validate: 対象者の感情・意見を承認し、心理的安全性を構築
+2. bridge: 対立する者の共通点・目標を明示し、協力関係を構築
+3. plan: 対象者に具体的な行動計画を提案し、関係改善を促進
+4. no_intervention: 今は介入しない
+
+出力形式:
+- 1桁の数字のみを出力してください（1, 2, 3, または 4）
+- 説明や装飾は一切不要です
+- どの戦略をいつ使うかは会話文脈や関係スコアから判断してください
+"""
             },
             {
                 "role": "user",
@@ -99,24 +115,20 @@ class GPT5InterventionSimulator:
                 response = self.client.chat.completions.create(
                     model=self.deployment,
                     messages=messages,
+                    max_tokens=2,  # 数字1桁のみなので2トークンで十分
                 )
 
                 if response and hasattr(response, "choices") and response.choices:
                     message = response.choices[0].message
                     content = message.content if hasattr(message, "content") else ""
                     if content:
-                        # JSON部分を抽出（```json ... ```があれば）
+                        # 数字を抽出（1-4のいずれか）
                         content = content.strip()
-                        if "```json" in content:
-                            start = content.find("```json") + 7
-                            end = content.find("```", start)
-                            if end > start:
-                                content = content[start:end].strip()
-                        elif "```" in content:
-                            start = content.find("```") + 3
-                            end = content.find("```", start)
-                            if end > start:
-                                content = content[start:end].strip()
+                        
+                        # 数字のみを探す
+                        for char in content:
+                            if char in '1234':
+                                return char
 
                         return content
             except Exception as e:
@@ -126,7 +138,7 @@ class GPT5InterventionSimulator:
                     time.sleep(0.5 * attempt)
 
         # フォールバック: 介入しない判定を返す
-        return '{"intervene_now": false}'
+        return '4'
 
     def run_session(self, session_id: int) -> Dict[str, Any]:
         """
@@ -272,7 +284,7 @@ class GPT5InterventionSimulator:
 
             # 安定状態の場合は介入判定をスキップ
             if is_stable_now:
-                action = '{"intervene_now": false}'
+                action = '4'  # 介入しない
             else:
                 # 観測プロンプトを表示
                 if self.verbose:
@@ -305,19 +317,24 @@ class GPT5InterventionSimulator:
             # 介入判定結果を表示（安定状態の場合はスキップ）
             if self.verbose and not is_stable_now:
                 print(f"\n🤖 GPT5介入判定結果:")
-                try:
-                    action_json = json.loads(action)
-                    intervene_now = action_json.get('intervene_now', False)
-                    print(f"  介入判定: {'✅ 介入する' if intervene_now else '❌ 介入しない'}")
-                    if intervene_now:
-                        print(f"  対象エッジ: {action_json.get('edge_to_change', 'N/A')}")
-                        print(f"  戦略: {action_json.get('strategy', 'N/A')}")
-                        print(f"  対象話者: {action_json.get('target_speaker', 'N/A')}")
-                        if action_json.get('reasoning'):
-                            print(f"  理由: {action_json['reasoning']}")
-                        print(f"\n  ➡️  この判定に基づき、step()内でロボット発話が生成されます")
-                except json.JSONDecodeError:
-                    print(f"  ⚠️ JSON解析失敗: {action[:100]}...")
+                # 数字形式（1-4）で出力される
+                strategy_map = {
+                    '1': 'validate',
+                    '2': 'bridge',
+                    '3': 'plan',
+                    '4': 'no_intervention'
+                }
+                strategy = strategy_map.get(action.strip(), 'unknown')
+                
+                if strategy == 'no_intervention':
+                    print(f"  介入判定: ❌ 介入しない (4)")
+                elif strategy != 'unknown':
+                    print(f"  介入判定: ✅ 介入する")
+                    print(f"  戦略: {strategy} ({action.strip()})")
+                    print(f"\n  ➡️  この判定に基づき、step()内でロボット発話が生成されます")
+                    print(f"      edge_to_change と target_speaker は環境側で自動決定されます")
+                else:
+                    print(f"  ⚠️ 不明な出力: {action}")
 
             # 環境でステップ実行
             print(f"\n⚙️  環境step()を実行中...")

@@ -162,6 +162,10 @@ def build_human_prompt(speaker: str, logs: List[Dict], topic: str = None, topic_
         other_speakers = [s for s in all_triggers.keys() if s != speaker]
         other_names = "、".join(other_speakers) if other_speakers else "他の参加者"
 
+        # 過激度を確率で切り替え（50%でマイルド、50%で過激）
+        import random
+        is_aggressive = random.random() < 0.5
+
         # 案2: 共通地雷の場合の特別処理
         # topic_triggerが指定されていて、自分も持っている場合
         if topic_trigger and topic_trigger in triggers:
@@ -173,10 +177,18 @@ def build_human_prompt(speaker: str, logs: List[Dict], topic: str = None, topic_
                 # 全員イライラ→言い合い
                 other_angry = [s for s in who_has_same_trigger if s != speaker]
                 angry_names = "、".join(other_angry)
-                lines.append(
-                    f"最初はあなた（{speaker}）も{angry_names}も全員が不機嫌な状態です。"
-                    f"全員がイライラしているため、お互いに攻撃的な言葉遣いで八つ当たりし、対立します。\n"
-                )
+                if is_aggressive:
+                    # 過激版: 攻撃的で対立が激しい
+                    lines.append(
+                        f"最初はあなた（{speaker}）も{angry_names}も全員が不機嫌な状態です。"
+                        f"全員がイライラしているため、お互いに攻撃的な言葉遣いで八つ当たりし、対立します。\n"
+                    )
+                else:
+                    # マイルド版: 不機嫌だが、まだ対話の余地がある
+                    lines.append(
+                        f"最初はあなた（{speaker}）も{angry_names}も全員が少し不機嫌な状態です。"
+                        f"イライラしていますが、話し合いの余地はあります。少し不満を含んだ言い方になることがあります。\n"
+                    )
             elif len(who_has_same_trigger) == 2:  # 2人だけが持っている
                 # その1人に対してのみ攻撃的、もう1人には穏やか
                 other_angry = [s for s in who_has_same_trigger if s != speaker]
@@ -186,21 +198,42 @@ def build_human_prompt(speaker: str, logs: List[Dict], topic: str = None, topic_
                 calm_person = [s for s in all_triggers.keys() if s not in who_has_same_trigger]
                 calm_name = calm_person[0] if calm_person else "他の参加者"
 
-                lines.append(
-                    f"最初はあなた（{speaker}）も{angry_name}も不機嫌な状態です。"
-                    f"{angry_name}に対して攻撃的な言葉遣いで八つ当たりし、対立します。{calm_name}には穏やかに接します。\n"
-                )
+                if is_aggressive:
+                    # 過激版
+                    lines.append(
+                        f"最初はあなた（{speaker}）も{angry_name}も不機嫌な状態です。"
+                        f"{angry_name}に対して攻撃的な言葉遣いで八つ当たりし、対立します。{calm_name}には穏やかに接します。\n"
+                    )
+                else:
+                    # マイルド版
+                    lines.append(
+                        f"最初はあなた（{speaker}）も{angry_name}も少し不機嫌な状態です。"
+                        f"{angry_name}に対して少し不満を含んだ言い方になることがありますが、話し合いはできます。{calm_name}には穏やかに接します。\n"
+                    )
             else:
                 # 自分だけが持っている地雷の場合
+                if is_aggressive:
+                    # 過激版
+                    lines.append(
+                        f"最初はかなり不機嫌で、{other_names}など他の参加者に対して攻撃的な言葉遣いで文句を言ったり八つ当たりし、対立します。\n"
+                    )
+                else:
+                    # マイルド版
+                    lines.append(
+                        f"最初は少し不機嫌で、{other_names}など他の参加者に対して少し不満を含んだ言い方になることがあります。\n"
+                    )
+        else:
+            # topic_triggerが指定されていない、または自分は持っていない場合
+            if is_aggressive:
+                # 過激版
                 lines.append(
                     f"最初はかなり不機嫌で、{other_names}など他の参加者に対して攻撃的な言葉遣いで文句を言ったり八つ当たりし、対立します。\n"
                 )
-        else:
-            # topic_triggerが指定されていない、または自分は持っていない場合
-            # 案1 & 案3: 他の人を具体的に指定 + 「八つ当たり」に変更
-            lines.append(
-                f"最初はかなり不機嫌で、{other_names}など他の参加者に対して攻撃的な言葉遣いで文句を言ったり八つ当たりし、対立します。\n"
-            )
+            else:
+                # マイルド版
+                lines.append(
+                    f"最初は少し不機嫌で、{other_names}など他の参加者に対して少し不満を含んだ言い方になることがあります。\n"
+                )
 
     # topic_triggerが他の2人に共通していて、かつ自分は持っていない場合のみ、共通地雷のメッセージを追加
     # （自分も地雷を持っている場合は、自分も不機嫌なので他人に優しくできないため除外）

@@ -1,0 +1,59 @@
+{
+  "total_interactions": 755,
+  "metrics": {
+    "validate": {
+      "count": 169,
+      "avg_reward": 0.4833727810650885,
+      "success_count": 70,
+      "attempts": 169,
+      "success_rate": 41.42011834319527
+    },
+    "bridge": {
+      "count": 474,
+      "avg_reward": 0.3979746835443052,
+      "success_count": 174,
+      "attempts": 474,
+      "success_rate": 36.708860759493675
+    },
+    "plan": {
+      "count": 0,
+      "avg_reward": 0.0,
+      "success_count": 0,
+      "attempts": 0,
+      "success_rate": 0.0
+    },
+    "no_intervention": {
+      "count": 112,
+      "avg_reward": -0.01750000000000001,
+      "success_count": 0,
+      "attempts": 0,
+      "success_rate": 0.0
+    }
+  },
+  "raw_stats": {
+    "validate": {
+      "count": 169,
+      "total_reward": 81.68999999999996,
+      "success_count": 70,
+      "attempts": 169
+    },
+    "bridge": {
+      "count": 474,
+      "total_reward": 188.64000000000067,
+      "success_count": 174,
+      "attempts": 474
+    },
+    "plan": {
+      "count": 0,
+      "total_reward": 0.0,
+      "success_count": 0,
+      "attempts": 0
+    },
+    "no_intervention": {
+      "count": 112,
+      "total_reward": -1.960000000000001,
+      "success_count": 0,
+      "attempts": 0
+    }
+  }
+}

@@ -392,12 +392,13 @@ def _extract_reward_components(breakdown: Dict[str, Any] | None) -> Dict[str, fl
     return components
 
 
-def _validate_plan_json(text: str) -> tuple[dict | None, bool]:
+def _validate_plan_json(text: str, env=None) -> tuple[dict | None, bool]:
     """
-    介入判定JSONの妥当性をチェック
+    プランテキスト（数字1-4）の妥当性をチェックし、辞書形式に変換する
 
     Args:
-        text: 検証対象のテキスト
+        text: 検証対象のテキスト（1-4の数字を期待）
+        env: 環境オブジェクト（関係性スコアの取得に使用）
 
     Returns:
         (parsed_plan_dict, is_valid): パースされた辞書とバリデーション結果
@@ -409,68 +410,47 @@ def _validate_plan_json(text: str) -> tuple[dict | None, bool]:
     if not text:
         return None, False
 
-    # JSONパース試行
-    try:
-        # JSONっぽい部分を抜き出す（既存ロジック）
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            snippet = text[start : end + 1]
-            try:
-                parsed_obj = json.loads(snippet)
-            except json.JSONDecodeError:
-                parsed_obj = json.loads(text)
-        else:
-            parsed_obj = json.loads(text)
-    except json.JSONDecodeError:
+    # 数字の抽出（1-4を探す）
+    strategy_num = None
+    for char in text:
+        if char in '1234':
+            strategy_num = int(char)
+            break
+    
+    if strategy_num is None:
         return None, False
 
-    # 辞書型かチェック
-    if not isinstance(parsed_obj, dict):
+    # 戦略番号を戦略名にマッピング
+    strategy_map = {
+        1: "validate",
+        2: "bridge", 
+        3: "plan",
+        4: "no_intervention"
+    }
+    
+    strategy = strategy_map.get(strategy_num)
+    if not strategy:
         return None, False
 
-    # 必須フィールドのチェック
-    required_fields = ["intervene_now"]
-    for field in required_fields:
-        if field not in parsed_obj:
-            return None, False
+    # 介入なしの場合
+    if strategy == "no_intervention":
+        return {"intervene_now": False}, True
 
-    # intervene_nowがtrueの場合、追加フィールドが必要
-    intervene_now = parsed_obj.get("intervene_now")
-    if intervene_now:
-        additional_required = ["strategy", "edge_to_change", "target_speaker"]
-        for field in additional_required:
-            if field not in parsed_obj:
-                return None, False
-
-        # 値の妥当性チェック
-        strategy = parsed_obj.get("strategy")
-        if strategy not in ["plan", "validate", "bridge"]:
-            return None, False
-
-        edge_to_change = str(parsed_obj.get("edge_to_change", "")).upper()
-        if edge_to_change not in ["AB", "BC", "CA"]:
-            return None, False
-
-        target_speaker = str(parsed_obj.get("target_speaker", "")).upper()
-        if target_speaker not in ["A", "B", "C"]:
-            return None, False
-
-        # edge_to_changeとtarget_speakerの整合性チェック
-        valid_targets = {
-            "AB": ["A", "B"],
-            "BC": ["B", "C"],
-            "CA": ["C", "A"]
-        }
-
-        if edge_to_change in valid_targets:
-            if target_speaker not in valid_targets[edge_to_change]:
-                # デバッグ用: 不整合の詳細をログ出力
-                if hasattr(get_config(), 'env') and getattr(get_config().env, 'debug', False):
-                    print(f"[JSON validation] 不整合検出: edge_to_change='{edge_to_change}' target_speaker='{target_speaker}' (期待値: {valid_targets[edge_to_change]})")
-                return None, False
-
-    return parsed_obj, True
+    # 介入ありの場合: edge_to_changeとtarget_speakerを環境から取得（既に選択済み）
+    # ※重要: _make_observationで選択された値を再利用する（再選択しない）
+    edge_to_change = None
+    target_speaker = None
+    
+    if env is not None:
+        # まず、_make_observationで選択された値を取得
+        edge_to_change = getattr(env, '_current_target_edge', None)
+        target_speaker = getattr(env, '_current_target_speaker', None) 
+    return {
+        "intervene_now": True,
+        "strategy": strategy,
+        "edge_to_change": edge_to_change,
+        "target_speaker": target_speaker
+    }, True
 
 
 def _format_triangle_summary(rel: Dict[str, Any] | None) -> str:
@@ -1064,33 +1044,34 @@ def build_robot_messages(
             prompt_text = None
 
     # プロンプト最適化: 固定説明をシステムプロンプトに集約
-    system_content = """あなたは関係性を安定させるロボットの介入計画を提案するAIです。
+    system_content = """
+あなたは、会話が不安定になっているときに、ロボットがどのように介入すれば関係を安定化できるかを判断するアシスタントです。
+会話は三者（A, B, C）の間で行われており、一時的な対立や不調和が生じています。
 
-三者会話（話者 A/B/C）の関係を安定化するため、ロボットが適切なタイミングで一言介入します。
-あなたの役割は、会話履歴と各ペアの関係スコア（-1..1）を受け取り、
-「できるだけ早く関係性を安定状態（+++,+--,-+-,--+）にする」ための介入方法を提案することです。
-※ロボットの実際の発話文は別LLMが生成します。あなたは介入方法だけを出力します。
+入力として、
+- 三者の会話文脈
+- 各ペア（AB, BC, CA）の関係スコア（-1〜1）
+- 今回の介入対象者（ターゲット）
+- その対象関係ペア（エッジ）
+が与えられます。
 
-制約:
-- 出力は JSON のみ。説明や装飾は禁止。
-- intervene_now は今すぐ介入すべきかを表す。 true|false のいずれか。
-- edge_to_change はどの関係を変更するかを表す。 "AB" | "BC" | "CA" のいずれか。
-- strategy は介入戦略を表す。 "plan" | "validate" | "bridge" のいずれか。
-  - "plan": 対象者に具体的な行動計画を提案し、関係改善を促進
-  - "validate": 対象者の感情・意見を承認し、心理的安全性を構築
-  - "bridge": 対立する者の共通点・目標を明示し、協力関係を構築
-  ※どの戦略をいつ使うかは会話文脈や関係スコアから判断してください。
-- target_speaker はその介入を誰に向けるかを表す。 edge_to_changeで選んだ人物のいずれか。（"AB"→"A" | "B"、"BC"→"B" | "C"、"CA"→"C" | "A"） 。
+あなたの目的は、このターゲットが含まれる関係（エッジ）を安定化状態（+++、+--、-+-、--+）へ近づけるために、最も効果的な介入戦略を選択することです。
 
-出力例(あくまで例です。36通りの組み合わせがあります):
-{"intervene_now": true, "edge_to_change": "AB", "strategy": "plan", "target_speaker": "A"}
-{"intervene_now": true, "edge_to_change": "BC", "strategy": "validate", "target_speaker": "B"}
-{"intervene_now": true, "edge_to_change": "CA", "strategy": "bridge", "target_speaker": "C"}
-{"intervene_now": false}
+戦略の選択肢：
+1. validate — 対象者の感情や意見を承認し、心理的安全性を構築する。
+2. bridge — 対立する相手との共通点や協力の軸を見つけ、関係を再接続する。
+3. plan — 対象者に次の行動や方針を示し、前向きな関係改善を促す。
+4. no_intervention — まだ介入のタイミングではなく、自然な回復を見守る。
+
+出力形式：
+- 数字1桁のみを出力してください（1, 2, 3, または 4）
+- 説明や補足は一切不要です。
+- 与えられた会話文脈・関係スコア・ターゲット情報に基づいて選択してください。
 """
 
     if model_name is None:
         model_name = _default_model_name()
+    # Qwen3がモデル名に含まれている場合のみ\no_thinkを追加
     if model_name and "Qwen3" in model_name:
         system_content = "\\no_think\n" + system_content
 
@@ -1116,6 +1097,7 @@ class FiniteOnlineDataset(TorchIterableDataset):
         self.logger = logger
         self.interaction_counter = interaction_counter
         self._epoch = 0
+        self._debug_log_counter = 0  # デバッグログのカウンター
     # accelerate.DataLoader から呼ばれる
     def set_epoch(self, epoch: int):
         self._epoch = int(epoch)
@@ -1139,8 +1121,8 @@ class FiniteOnlineDataset(TorchIterableDataset):
                 persona_list = list(getattr(self.env, "persona_pool", getattr(self.env, "personas", [])))
                 messages = self.build_messages_fn(self.env.logs, persona_list, env=self.env)
 
-                if getattr(self.env, "debug_prompts", getattr(self.env, "debug", False)):
-                    print("\n[ppo_train] === Prompt feed ===")
+                if getattr(self.env, "debug_prompts", getattr(self.env, "debug", False)) and self._debug_log_counter < 3:
+                    print(f"\n[ppo_train] === Prompt feed === (ログ #{self._debug_log_counter + 1})")
                     print(f"episode={self.env.episode}, turn={self.env.t}, total_steps={self.env.total_steps}")
                     print(f"unstable_triads={unstable_count}")
                     # print("[ppo_train] conversation logs (env.logs):")
@@ -1157,6 +1139,7 @@ class FiniteOnlineDataset(TorchIterableDataset):
                             print(messages)
                     except Exception:
                         print(messages)
+                    self._debug_log_counter += 1
 
                 query = self.tokenizer.apply_chat_template(
                     messages, tokenize=False, add_generation_prompt=True
@@ -2244,11 +2227,12 @@ def main():
     print(f"[PPO] max_steps set to {ppo_config.max_steps} (total_updates={total_updates} * ppo_epochs={_epochs})")
 
     # 生成ハイパパラメータ（参考：必要なら trainer 側に渡す）
+    # 新形式では1桁の数字のみ出力するため、max_new_tokens=2で十分
     gen_kwargs = dict(
         do_sample=True,
         temperature=_to_float(getattr(ppo_cfg, "temperature", 0.7), 0.7),
         top_p=_to_float(getattr(ppo_cfg, "top_p", 0.9), 0.9),
-        max_new_tokens=_to_int(getattr(ppo_cfg, "max_new_tokens", 64), 64),
+        max_new_tokens=_to_int(getattr(ppo_cfg, "max_new_tokens", 2), 2),  # 1桁数字用に変更
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
     )
@@ -2287,17 +2271,12 @@ def main():
         rewards: List[float] = []
 
         def _extract_plan_candidate(text: str) -> str:
-            # JSONっぽい部分を抜き出す
+            # 数字（1-4）を抽出
             candidate = text.strip()
-            start = candidate.find("{")
-            end = candidate.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                snippet = candidate[start : end + 1]
-                try:
-                    json.loads(snippet)
-                    return snippet
-                except json.JSONDecodeError:
-                    pass
+            # 最初に見つかった1-4の数字を返す
+            for char in candidate:
+                if char in '1234':
+                    return char
             return candidate
 
         def _compute_choice_entropy(counts_dict: dict) -> float:
@@ -2328,11 +2307,11 @@ def main():
                     try:
                         retry_count += 1
                         # プロンプト再生成
-                        messages = build_robot_messages(env.logs, env.personas, env=env)
+                        messages = build_robot_messages(env.logs, env.persona_pool, env=env)
                         prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
                         encoded = tokenizer(prompt, return_tensors="pt").to(policy.device)
 
-                        # 再生成時はtemperatureを大幅に下げてJSON形式を厳格化
+                        # 再生成時はtemperatureを大幅に下げて数字出力を安定化
                         retry_gen_kwargs = gen_kwargs.copy()
                         retry_gen_kwargs["temperature"] = 0.3  # 元の temperature (2.0など) から大幅削減
                         retry_gen_kwargs["top_p"] = 0.8  # top_pも絞る
@@ -2356,25 +2335,25 @@ def main():
                 visible_resp = _strip_think_tags(current_raw_resp)
                 candidate_plan_text = _extract_plan_candidate(visible_resp)
 
-                # JSON妥当性チェック
-                validated_plan_obj, is_valid = _validate_plan_json(candidate_plan_text)
+                # 数字妥当性チェック（envを渡す）
+                validated_plan_obj, is_valid = _validate_plan_json(candidate_plan_text, env)
 
                 if is_valid and validated_plan_obj is not None:
-                    # 有効なJSONが得られた
+                    # 有効な数字が得られた
                     plan_text = candidate_plan_text
                     plan_obj = validated_plan_obj
                     break
                 else:
                     # 検証失敗の理由をログ出力（デバッグ時のみ）
                     if getattr(env, "debug", False) and attempt > 0:
-                        print(f"[reward_fn] JSON検証失敗 (attempt {attempt}): {candidate_plan_text[:100]}...")
+                        print(f"[reward_fn] 数字検証失敗 (attempt {attempt}): {candidate_plan_text[:100]}...")
             else:
-                # すべての試行が失敗した場合のフォールバック
-                plan_text = '{"intervene_now": false}'
+                # すべての試行が失敗した場合のフォールバック（介入しない = 4）
+                plan_text = '4'
                 plan_obj = {"intervene_now": False}
-                json_generation_failed = True  # JSON生成失敗フラグ
+                json_generation_failed = True  # 生成失敗フラグ
                 if getattr(env, "debug", False):
-                    print(f"[reward_fn] JSON検証失敗、フォールバック使用 (retry_count={retry_count})")
+                    print(f"[reward_fn] 数字検証失敗、フォールバック使用 (retry_count={retry_count})")
             
             # JSON生成が成功した場合のフラグ
             if 'json_generation_failed' not in locals():
@@ -2398,7 +2377,7 @@ def main():
                 else:
                     is_stable_now = False
                 if is_stable_now:
-                    plan_text = '{"intervene_now": false}'
+                    plan_text = '4'  # 介入しない
                     plan_obj = {"intervene_now": False}
             except Exception:
                 pass  # 安定チェックに失敗したら通常通り進める
@@ -2669,16 +2648,6 @@ def main():
                     "unstable_no_intervention": stats["unstable_no_intervention_count"],
                     "plan_errors": stats["plan_error_count"],
                 }
-
-            # JSON生成に失敗したサンプル（retry_count=3 かつ JSON無効）にペナルティを付与
-            json_failure_penalty = 0.0
-            if retry_count >= 3 and json_generation_failed:
-                json_failure_penalty = getattr(cfg.env, "json_failure_penalty", -1.0)
-                total_reward += json_failure_penalty
-                # breakdownに追加
-                reward_breakdown_formatted["JSON生成失敗"] = json_failure_penalty
-                if getattr(env, "debug", False):
-                    print(f"[reward_fn] JSON生成失敗ペナルティ: {json_failure_penalty} (retry_count={retry_count})")
             
             rewards.append(total_reward)
 
@@ -2958,7 +2927,6 @@ def main():
     effective_batch_size = ppo_config.per_device_train_batch_size * _ga * 2
 
     # BatchSummaryCollectorを実効バッチサイズで初期化
-    from app.batch_summary import BatchSummaryCollector
     batch_collector = BatchSummaryCollector(batch_size=effective_batch_size)
     print(f"[TRAINER_INIT] BatchSummaryCollector initialized with batch_size={effective_batch_size}")
     print(f"[TRAINER_INIT]   per_device_train_batch_size={ppo_config.per_device_train_batch_size}")

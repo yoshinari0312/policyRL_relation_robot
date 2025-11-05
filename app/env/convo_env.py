@@ -55,6 +55,89 @@ def _coerce_int(value: Any) -> Optional[int]:
         return None
 
 
+def select_target_edge_and_speaker(
+    edges: Dict[Any, float],
+    debug: bool = False,
+    debug_prefix: str = ""
+) -> Tuple[str, str]:
+    """
+    関係性エッジから改善対象エッジとターゲット話者を選択する。
+    
+    ロジック:
+    1. 絶対値が最小（最も0に近い）負のエッジを選択
+    2. 負のエッジがない場合は最小スコアのエッジを選択
+    3. ターゲット話者はエッジの2人からランダムに選択
+    
+    Args:
+        edges: エッジ辞書 {(A,B): score, ...} または {"AB": score, ...}
+        debug: デバッグ出力を有効にするか
+        debug_prefix: デバッグメッセージのプレフィックス
+        
+    Returns:
+        (edge_to_change, target_speaker) のタプル
+        edge_to_change は正規化済み ("AB", "BC", "CA" のいずれか)
+    """
+    import random
+    
+    edge_to_change = None
+    
+    if debug:
+        print(f"{debug_prefix} edges取得: {edges}")
+    
+    # 負のエッジのみを抽出し、絶対値でソート
+    negative_edges = []
+    for edge_key, score in edges.items():
+        if score < 0:
+            # edge_keyが文字列でない場合は変換
+            if isinstance(edge_key, tuple):
+                edge_str = "".join(str(c) for c in edge_key)
+            else:
+                edge_str = str(edge_key)
+            negative_edges.append((edge_str, score))
+            if debug:
+                print(f"{debug_prefix} 負エッジ追加: {edge_str} = {score} (絶対値: {abs(score)})")
+    
+    if negative_edges:
+        # 絶対値が最小（最も0に近い）負のエッジを選択
+        negative_edges.sort(key=lambda x: abs(x[1]))
+        edge_to_change = negative_edges[0][0]
+        if debug:
+            print(f"{debug_prefix} ソート後: {negative_edges}")
+            print(f"{debug_prefix} 選択: {edge_to_change} (スコア: {negative_edges[0][1]})")
+    else:
+        # 負のエッジがない場合は、最小スコアのエッジを選択
+        if edges:
+            min_edge = min(edges.items(), key=lambda x: x[1])
+            if isinstance(min_edge[0], tuple):
+                edge_to_change = "".join(str(c) for c in min_edge[0])
+            else:
+                edge_to_change = str(min_edge[0])
+            if debug:
+                print(f"{debug_prefix} 負エッジなし、最小選択: {edge_to_change}")
+    
+    
+    # edge_to_changeを正規化
+    edge_before_norm = edge_to_change
+    edge_to_change = edge_to_change.replace(",", "").replace(" ", "").upper()
+    if edge_to_change not in {"AB", "BC", "CA"}:
+        if len(edge_to_change) == 2 and edge_to_change[1] + edge_to_change[0] in {"AB", "BC", "CA"}:
+            edge_to_change = edge_to_change[1] + edge_to_change[0]
+            if debug:
+                print(f"{debug_prefix} 反転: {edge_before_norm} → {edge_to_change}")
+        else:
+            edge_to_change = "AB"
+            if debug:
+                print(f"{debug_prefix} 不正なエッジ、ABに修正: {edge_before_norm}")
+    else:
+        if debug:
+            print(f"{debug_prefix} 正規化: {edge_before_norm} → {edge_to_change}")
+    
+    # target_speaker: edge_to_changeの2人からランダムに選択
+    target_speaker = random.choice(list(edge_to_change))
+    
+    return edge_to_change, target_speaker
+
+
 class ConversationEnv:
     """ 三者会話環境 """
 
@@ -1078,19 +1161,62 @@ class ConversationEnv:
             history_lines = ["(履歴なし)"]
 
         scores = context.get("scores", {}) or {"AB": 0.0, "BC": 0.0, "CA": 0.0}
-        stable_sign = context.get("stable_sign", "???")
-        target_edge = context.get("target_edge", "AB")
-        eval_horizon = context.get("evaluation_horizon", self.evaluation_horizon)
-        time_penalty = context.get("time_penalty", self.time_penalty)
-        intervention_cost = context.get("intervention_cost", self.intervention_cost)
+        
+        # 改善すべきエッジとターゲット話者を特定（共通関数を使用）
+        # ※重要: ターゲット話者はここで1回だけランダムに選択し、
+        #   後続の_parse_planで再利用する（2回選択すると不整合が生じるため）
+        # relation_snapshot()から取得したエッジ情報を使用
+        rel = self.relation_snapshot()
+        if isinstance(rel, dict):
+            metrics = rel.get("metrics", rel)
+            edges = metrics.get("edges", {})
+            if edges:
+                target_edge, target_speaker = select_target_edge_and_speaker(
+                    edges, 
+                    debug=False,  # observation生成時はデバッグ出力不要
+                    debug_prefix=""
+                )
+                # 選択したターゲット話者を保存（_parse_planで再利用）
+                self._current_target_edge = target_edge
+                self._current_target_speaker = target_speaker
+                
+                # エッジのスコアを取得
+                # edgesのキーはタプルの可能性があるので、両方の形式を試す
+                target_score = None
+                for edge_key, score in edges.items():
+                    if isinstance(edge_key, tuple):
+                        edge_str = "".join(str(c) for c in edge_key)
+                    else:
+                        edge_str = str(edge_key).replace(",", "").replace(" ", "").upper()
+                    if edge_str == target_edge or edge_str == target_edge[::-1]:
+                        target_score = score
+                        break
+                
+                if target_score is None:
+                    target_score = 0.0
+            else:
+                target_edge = "AB"
+                target_score = 0.0
+                target_speaker = "A"
+                self._current_target_edge = target_edge
+                self._current_target_speaker = target_speaker
+        else:
+            target_edge = "AB"
+            target_score = 0.0
+            target_speaker = "A"
+            self._current_target_edge = target_edge
+            self._current_target_speaker = target_speaker
 
-        # プロンプト最適化: 可変要素（会話履歴、関係スコア）のみを返す
+        # プロンプト最適化: 可変要素（会話履歴、関係スコア、改善対象）を返す
         # 固定説明（タスク、制約、戦略）はシステムプロンプトに移動済み（build_robot_messages参照）
         prompt_lines = [
             "履歴:",
             *history_lines,
             "",
             "現在の関係スコア（-1..1）: " + ", ".join(f"w_{edge}={value:+.2f}" for edge, value in scores.items()),
+            "",
+            f"改善すべきエッジ: {target_edge} (現在: {target_score:+.2f})",
+            f"発話対象（ターゲット）: {target_speaker}",
         ]
         return "\n".join(prompt_lines)
 
@@ -1102,41 +1228,82 @@ class ConversationEnv:
         if not text:
             return None, "empty_action", None
 
+        # 新形式: 数字1-4のパース
+        strategy_num = None
+        for char in text:
+            if char in '1234':
+                strategy_num = int(char)
+                break
+        
+        # JSONパース（旧形式との後方互換性のため）
+        json_parsed = False
+        payload = None
         try:
             payload = json.loads(text)
+            json_parsed = True
         except json.JSONDecodeError:
-            return None, "not_json", text
-
-        if not isinstance(payload, dict):
-            return None, "plan_not_object", text
+            pass
 
         plan: Dict[str, Any] = {}
-        intervene_now = _coerce_bool(payload.get("intervene_now"))
-        if intervene_now is None:
-            intervene_now = bool(payload.get("intervene_now"))
-        plan["intervene_now"] = bool(intervene_now)
 
-        edge_raw = str(payload.get("edge_to_change", "AB")).upper().strip()
-        if edge_raw not in {"AB", "BC", "CA"}:
-            edge_raw = "AB"
-        plan["edge_to_change"] = edge_raw
+        # 新形式（数字）の処理
+        if strategy_num is not None:
+            strategy_map = {
+                1: "validate",
+                2: "bridge",
+                3: "plan",
+                4: "no_intervention"
+            }
+            
+            strategy = strategy_map.get(strategy_num)
+            if not strategy:
+                return None, "invalid_strategy_number", text
+            
+            if strategy == "no_intervention":
+                plan["intervene_now"] = False
+                return plan, None, None
+            
+            # 介入ありの場合
+            plan["intervene_now"] = True
+            plan["strategy"] = strategy
+            
+            # edge_to_changeとtarget_speakerは_make_observationで既に選択済み
+            # ※重要: ターゲット話者をここで再選択すると、LLMに提示した値と異なる値になる
+            #   可能性があるため、_make_observationで選択した値を再利用する
+            edge_to_change = getattr(self, '_current_target_edge', None)
+            target_speaker = getattr(self, '_current_target_speaker', None)
+            
+            plan["edge_to_change"] = edge_to_change
+            plan["target_speaker"] = target_speaker
+            
+            return plan, None, None
 
-        strategy_raw = str(payload.get("strategy", "plan")).strip()
-        if strategy_raw not in _PLANNER_STRATEGIES:
-            strategy_raw = "plan"
-        plan["strategy"] = strategy_raw
+        # 旧形式（JSON）の処理（後方互換性）
+        elif json_parsed and isinstance(payload, dict):
+            intervene_now = _coerce_bool(payload.get("intervene_now"))
+            if intervene_now is None:
+                intervene_now = bool(payload.get("intervene_now"))
+            plan["intervene_now"] = bool(intervene_now)
 
-        target_raw = str(payload.get("target_speaker", "A")).upper().strip()
-        if target_raw not in {"A", "B", "C"}:
-            target_raw = "A"
-        plan["target_speaker"] = target_raw
+            edge_raw = str(payload.get("edge_to_change", "AB")).upper().strip()
+            if edge_raw not in {"AB", "BC", "CA"}:
+                edge_raw = "AB"
+            plan["edge_to_change"] = edge_raw
 
-        recheck_raw = _coerce_int(payload.get("recheck_after_turns", self.evaluation_horizon))
-        if recheck_raw is None or recheck_raw <= 0:
-            recheck_raw = self.evaluation_horizon
-        plan["recheck_after_turns"] = max(self.evaluation_horizon, recheck_raw)
+            strategy_raw = str(payload.get("strategy", "plan")).strip()
+            if strategy_raw not in _PLANNER_STRATEGIES:
+                strategy_raw = "plan"
+            plan["strategy"] = strategy_raw
 
-        return plan, None, None
+            target_raw = str(payload.get("target_speaker", "A")).upper().strip()
+            if target_raw not in {"A", "B", "C"}:
+                target_raw = "A"
+            plan["target_speaker"] = target_raw
+
+            return plan, None, None
+        
+        else:
+            return None, "not_json_or_number", text
 
     def _render_intervention(self, plan: Dict[str, Any], *, simulate: bool) -> Dict[str, Any]:
         # 介入発話を生成する
@@ -1166,9 +1333,9 @@ class ConversationEnv:
         history_text = "\n".join(history_lines) if history_lines else "(履歴なし)"
 
         directive_map = {
-            "plan": f"直前の{target_name}さんや他の参加者の発言から、「これからどうするか」という未来志向の視点を提示してください。具体的な次の一歩や小さな行動案を一文で示し、前向きな行動を促してください。",
-            "validate": f"{target_name}さんの感情や意見を明確に承認・共感し、その価値を認めてください。心理的安全性を作り、建設的な対話を可能にする一文を述べてください。",
-            "bridge": f"{target_name}さんと{partner_name}さんの間に共通点・共通の目標・相互依存性を見出してください。対立ではなく協力関係として捉え直せる視点を一文で提示してください。",
+            "plan": f"{target_name}さんに対して、{partner_name}さんとの関係を改善するために「これからどうするか」という未来志向の視点を提示してください。具体的な次の一歩や小さな行動案を一文で示し、前向きな行動を促してください。",
+            "validate": f"{target_name}さんの感情や意見を明確に承認・共感し、その価値を認めてください。{partner_name}さんとの関係改善に向けて、{target_name}さんが理解され、尊重されていると感じられるような一文を述べてください。",
+            "bridge": f"{target_name}さんと{partner_name}さんの間に共通点・共通の目標・相互依存性を見出し、両者をつなぐ役割を果たす一文を述べてください。対立や誤解を和らげ、協力的な関係構築を促進してください。",
         }
         directive = directive_map.get(strategy, directive_map["plan"])
 
@@ -1183,17 +1350,17 @@ class ConversationEnv:
         base_backoff = getattr(cfg.llm, "base_backoff", 0.5) or 0.5
         if client and deployment:
             user_payload = (
-                "あなたは会話の調整役です。出力は日本語で一文のみ。話者ラベルや括弧は使わない。\n"
+                f"あなたは{target_name}さんと{partner_name}さんの関係性を良くするためにロボットの発言を生成します。出力は日本語で一文のみ。話者ラベルや括弧は使わない。\n"
                 "会話履歴を参考にしながら、以下の指示に従って発話を生成してください。\n\n"
                 f"指示: {directive}\n"
                 f"会話履歴:\n{history_text}\n\n"
                 "必須条件:\n"
-                f"- {target_name} さんの名前を一度だけ入れる。\n"
+                f"- {target_name} さんと{partner_name} さんの名前を一度だけ入れる。\n"
                 "- 直前の話題を自然に引き継ぐ。\n"
                 "- 一文のみ (60字前後)。\n"
             )
             messages = [
-                {"role": "system", "content": "あなたは会話の調整役として、適切な発話内容を作成します。常に日本語の一文だけを返します。"},
+                {"role": "system", "content": "あなたは関係性を良くするためのロボットの発言生成器として、適切な発話内容を作成します。常に日本語の一文だけを返します。"},
                 {"role": "user", "content": user_payload},
             ]
             for attempt in range(1, max_attempts + 1):
@@ -1509,14 +1676,6 @@ class ConversationEnv:
             return False, "plan_not_dict"
         if "intervene_now" not in plan:
             return False, "missing_intervene_now"
-        try:
-            recheck = int(plan.get("recheck_after_turns", self.evaluation_horizon))
-        except Exception:
-            return False, "invalid_recheck"
-        if recheck <= 0:
-            return False, "recheck_non_positive"
-        if recheck < self.evaluation_horizon:
-            return False, "recheck_too_short"
 
         intervene_now = bool(plan.get("intervene_now"))
         if intervene_now:

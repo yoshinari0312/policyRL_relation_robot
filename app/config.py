@@ -249,12 +249,12 @@ def load_config(yaml_path: str = "config.local.yaml") -> AppConfig:
     env_dict = dict(y.get("env") or {})
 
     # デバッグ: env_dictの内容を確認
-    if env_dict.get("debug"):
-        print(f"[config.py] env_dict keys: {env_dict.keys()}")
-        print(f"[config.py] 'personas' in env_dict: {'personas' in env_dict}")
-        if "personas" in env_dict:
-            print(f"[config.py] env_dict['personas'] type: {type(env_dict['personas'])}")
-            print(f"[config.py] env_dict['personas'] keys: {env_dict['personas'].keys() if isinstance(env_dict['personas'], dict) else 'N/A'}")
+    # if env_dict.get("debug"):
+    #     print(f"[config.py] env_dict keys: {env_dict.keys()}")
+    #     print(f"[config.py] 'personas' in env_dict: {'personas' in env_dict}")
+    #     if "personas" in env_dict:
+    #         print(f"[config.py] env_dict['personas'] type: {type(env_dict['personas'])}")
+    #         print(f"[config.py] env_dict['personas'] keys: {env_dict['personas'].keys() if isinstance(env_dict['personas'], dict) else 'N/A'}")
 
     # 後方互換性: トップレベルのpersonasをenv.personasにマッピング
     legacy_personas = y.get("personas")
@@ -262,10 +262,10 @@ def load_config(yaml_path: str = "config.local.yaml") -> AppConfig:
         env_dict["personas"] = legacy_personas
 
     filtered_env_dict = _filter_kwargs(EnvCfg, env_dict)
-    if env_dict.get("debug"):
-        print(f"[config.py] After _filter_kwargs, 'personas' in filtered: {'personas' in filtered_env_dict}")
-        if "personas" in filtered_env_dict:
-            print(f"[config.py] filtered personas type: {type(filtered_env_dict['personas'])}")
+    # if env_dict.get("debug"):
+    #     print(f"[config.py] After _filter_kwargs, 'personas' in filtered: {'personas' in filtered_env_dict}")
+    #     if "personas" in filtered_env_dict:
+    #         print(f"[config.py] filtered personas type: {type(filtered_env_dict['personas'])}")
 
     env = EnvCfg(**filtered_env_dict)
     scorer = ScorerCfg(**_filter_kwargs(ScorerCfg, y.get("scorer")))
