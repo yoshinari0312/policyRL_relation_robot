@@ -432,11 +432,7 @@ def _validate_plan_json(text: str, env=None) -> tuple[dict | None, bool]:
     if not strategy:
         return None, False
 
-    # 介入なしの場合
-    if strategy == "no_intervention":
-        return {"intervene_now": False}, True
-
-    # 介入ありの場合: edge_to_changeとtarget_speakerを環境から取得（既に選択済み）
+    # edge_to_changeとtarget_speakerを環境から取得（既に選択済み）
     # ※重要: _make_observationで選択された値を再利用する（再選択しない）
     edge_to_change = None
     target_speaker = None
@@ -444,7 +440,30 @@ def _validate_plan_json(text: str, env=None) -> tuple[dict | None, bool]:
     if env is not None:
         # まず、_make_observationで選択された値を取得
         edge_to_change = getattr(env, '_current_target_edge', None)
-        target_speaker = getattr(env, '_current_target_speaker', None) 
+        target_speaker = getattr(env, '_current_target_speaker', None)
+        
+        # デバッグ: 値が取得できているか確認
+        if getattr(env, "debug", False):
+            print(f"[_validate_plan_json] strategy={strategy}, edge_to_change={edge_to_change}, target_speaker={target_speaker}")
+        
+        # edge_to_changeが取得できない場合はエラーとして扱う（フォールバックしない）
+        if not edge_to_change:
+            if getattr(env, "debug", False):
+                print(f"[_validate_plan_json] エラー: edge_to_changeが取得できません（_make_observationが呼ばれていない可能性）")
+            return None, False
+    else:
+        # envがNoneの場合もエラー
+        return None, False
+
+    # 介入なしの場合でもedge_to_changeとtarget_speakerを含める
+    if strategy == "no_intervention":
+        return {
+            "intervene_now": False,
+            "edge_to_change": edge_to_change,
+            "target_speaker": target_speaker
+        }, True
+
+    # 介入ありの場合
     return {
         "intervene_now": True,
         "strategy": strategy,
@@ -973,12 +992,14 @@ class TrainingRunLogger:
                             "strategy/bridge_ratio": strategy_counts.get("bridge", 0) / total,
                             "strategy/plan_ratio": strategy_counts.get("plan", 0) / total,
                             "strategy/no_intervention_ratio": strategy_counts.get("no_intervention", 0) / total,
+                            "strategy/output_error_ratio": strategy_counts.get("output_error", 0) / total,
 
                             # 戦略カウント
                             "strategy/validate_count": strategy_counts.get("validate", 0),
                             "strategy/bridge_count": strategy_counts.get("bridge", 0),
                             "strategy/plan_count": strategy_counts.get("plan", 0),
                             "strategy/no_intervention_count": strategy_counts.get("no_intervention", 0),
+                            "strategy/output_error_count": strategy_counts.get("output_error", 0),
 
                             # 介入率メトリクス
                             "intervention/rate": intervention_rate,
@@ -1045,7 +1066,7 @@ def build_robot_messages(
 
     # プロンプト最適化: 固定説明をシステムプロンプトに集約
     system_content = """
-あなたは、会話が不安定になっているときに、ロボットがどのように介入すれば関係を安定化できるかを判断するアシスタントです。
+あなたは、会話が不安定になっているときに、ロボットがどのように介入すれば関係を安定化できるかを判断し、数字1桁を出力するアシスタントです。
 会話は三者（A, B, C）の間で行われており、一時的な対立や不調和が生じています。
 
 入力として、
@@ -1055,25 +1076,22 @@ def build_robot_messages(
 - その対象関係ペア（エッジ）
 が与えられます。
 
-あなたの目的は、このターゲットが含まれる関係（エッジ）を安定化状態（+++、+--、-+-、--+）へ近づけるために、最も効果的な介入戦略を選択することです。
+あなたの目的は、このターゲットが含まれる関係（エッジ）を安定化状態（+）へ近づけるために、最も効果的な介入戦略を選択することです。
 
 戦略の選択肢：
 1. validate — 対象者の感情や意見を承認し、心理的安全性を構築する。
 2. bridge — 対立する相手との共通点や協力の軸を見つけ、関係を再接続する。
 3. plan — 対象者に次の行動や方針を示し、前向きな関係改善を促す。
-4. no_intervention — まだ介入のタイミングではなく、自然な回復を見守る。
+4. no_intervention — 対立が軽度で、介入が逆効果になりそうなときや自然回復が見込める時に選ぶ。
 
 出力形式：
-- 数字1桁のみを出力してください（1, 2, 3, または 4）
+- **数字1桁のみ**を出力してください（1, 2, 3, または 4）
 - 説明や補足は一切不要です。
-- 与えられた会話文脈・関係スコア・ターゲット情報に基づいて選択してください。
+- 与えられた会話文脈・関係スコア・ターゲット・エッジ情報に基づいて選択してください。
 """
 
-    if model_name is None:
-        model_name = _default_model_name()
-    # Qwen3がモデル名に含まれている場合のみ\no_thinkを追加
-    if model_name and "Qwen3" in model_name:
-        system_content = "\\no_think\n" + system_content
+    # Note: Qwen3のthinkingモード無効化はapply_chat_templateのenable_thinking=Falseで制御
+    # ここではプロンプトに\no_thinkタグを追加しない
 
     messages = [
         {"role": "system", "content": system_content},
@@ -1089,13 +1107,14 @@ class FiniteOnlineDataset(TorchIterableDataset):
     `num_ppo_epochs=1` にしておけば、合計サンプル数＝更新回数×バッチサイズで
     ちょうど意図した回数だけ PPO 更新が走ります。
     """
-    def __init__(self, tokenizer, env, build_messages_fn, total_samples: int, logger=None, interaction_counter=None):
+    def __init__(self, tokenizer, env, build_messages_fn, total_samples: int, logger=None, interaction_counter=None, model_name=None):
         self.tokenizer = tokenizer
         self.env = env
         self.build_messages_fn = build_messages_fn
         self.total_samples = int(total_samples)
         self.logger = logger
         self.interaction_counter = interaction_counter
+        self.model_name = model_name  # Qwen3判定用にモデル名を保存
         self._epoch = 0
         self._debug_log_counter = 0  # デバッグログのカウンター
     # accelerate.DataLoader から呼ばれる
@@ -1141,9 +1160,20 @@ class FiniteOnlineDataset(TorchIterableDataset):
                         print(messages)
                     self._debug_log_counter += 1
 
-                query = self.tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
+                # Qwen3の場合のみenable_thinking=Falseを指定
+                if self.model_name and "Qwen3" in self.model_name:
+                    query = self.tokenizer.apply_chat_template(
+                        messages, 
+                        tokenize=False, 
+                        add_generation_prompt=True,
+                        enable_thinking=False
+                    )
+                else:
+                    query = self.tokenizer.apply_chat_template(
+                        messages, 
+                        tokenize=False, 
+                        add_generation_prompt=True
+                    )
                 generated += 1
                 yield {"query": query}
             else:
@@ -2208,14 +2238,16 @@ def main():
         tokenizer, env, build_robot_messages,
         total_samples=total_samples,
         logger=training_logger,
-        interaction_counter=interaction_counter
+        interaction_counter=interaction_counter,
+        model_name=model_id
     )
     eval_samples = max(1, effective_batch_size)
     eval_ds = FiniteOnlineDataset(
         tokenizer, env, build_robot_messages,
         total_samples=eval_samples,
         logger=training_logger,
-        interaction_counter=interaction_counter
+        interaction_counter=interaction_counter,
+        model_name=model_id
     )
 
     # TRL 側で要求されるバッチ回数を total_updates に合わせる
@@ -2291,73 +2323,48 @@ def main():
             return entropy
 
         for resp in samples:
-            # 再推論ロジック: 不正なJSONの場合は最大3回再試行
-            retry_count = 0
-            max_retries = 3
+            # 1回のみ試行（retryなし）
             plan_text = None
             plan_obj = None
-            final_raw_resp = ""
+            json_generation_failed = False
+            
+            # プロンプトを生成
+            current_raw_resp = resp or ""
+            final_raw_resp = current_raw_resp
+            visible_resp = _strip_think_tags(current_raw_resp)
+            candidate_plan_text = _extract_plan_candidate(visible_resp)
 
-            for attempt in range(max_retries + 1):
-                if attempt == 0:
-                    # 初回: 元のレスポンスを使用
-                    current_raw_resp = resp or ""
-                else:
-                    # 再推論: 同じプロンプトで新しいサンプルを生成
-                    try:
-                        retry_count += 1
-                        # プロンプト再生成
-                        messages = build_robot_messages(env.logs, env.persona_pool, env=env)
-                        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                        encoded = tokenizer(prompt, return_tensors="pt").to(policy.device)
+            # 数字妥当性チェック（envを渡す）
+            validated_plan_obj, is_valid = _validate_plan_json(candidate_plan_text, env)
 
-                        # 再生成時はtemperatureを大幅に下げて数字出力を安定化
-                        retry_gen_kwargs = gen_kwargs.copy()
-                        retry_gen_kwargs["temperature"] = 0.3  # 元の temperature (2.0など) から大幅削減
-                        retry_gen_kwargs["top_p"] = 0.8  # top_pも絞る
-                        retry_gen_kwargs["do_sample"] = True  # サンプリングは維持（完全greedyだと同じ出力）
-                        
-                        # 再生成（厳格モード）
-                        with torch.no_grad():
-                            generated = policy.generate(
-                                **encoded,
-                                **retry_gen_kwargs,
-                            )
-                        gen_ids = generated[0, encoded["input_ids"].shape[-1]:]
-                        current_raw_resp = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
-                    except Exception as e:
-                        # 再推論に失敗した場合は元のレスポンスを使用
-                        current_raw_resp = resp or ""
-                        if getattr(env, "debug", False):
-                            print(f"[reward_fn] 再推論失敗 (attempt {attempt}): {e}")
-
-                final_raw_resp = current_raw_resp
-                visible_resp = _strip_think_tags(current_raw_resp)
-                candidate_plan_text = _extract_plan_candidate(visible_resp)
-
-                # 数字妥当性チェック（envを渡す）
-                validated_plan_obj, is_valid = _validate_plan_json(candidate_plan_text, env)
-
-                if is_valid and validated_plan_obj is not None:
-                    # 有効な数字が得られた
-                    plan_text = candidate_plan_text
-                    plan_obj = validated_plan_obj
-                    break
-                else:
-                    # 検証失敗の理由をログ出力（デバッグ時のみ）
-                    if getattr(env, "debug", False) and attempt > 0:
-                        print(f"[reward_fn] 数字検証失敗 (attempt {attempt}): {candidate_plan_text[:100]}...")
+            if is_valid and validated_plan_obj is not None:
+                # 有効な数字が得られた
+                plan_text = candidate_plan_text
+                plan_obj = validated_plan_obj
             else:
-                # すべての試行が失敗した場合のフォールバック（介入しない = 4）
-                plan_text = '4'
-                plan_obj = {"intervene_now": False}
+                # 検証失敗: output_errorとして扱う
+                plan_text = 'output_error'
+                plan_obj = {
+                    "intervene_now": False,
+                    "strategy": "output_error",
+                    "edge_to_change": getattr(env, '_current_target_edge', None),
+                    "target_speaker": getattr(env, '_current_target_speaker', None)
+                }
                 json_generation_failed = True  # 生成失敗フラグ
                 if getattr(env, "debug", False):
-                    print(f"[reward_fn] 数字検証失敗、フォールバック使用 (retry_count={retry_count})")
+                    print(f"[reward_fn] output_error検出: {candidate_plan_text[:100] if candidate_plan_text else 'None'}...")
             
             # JSON生成が成功した場合のフラグ
             if 'json_generation_failed' not in locals():
                 json_generation_failed = False
+
+            # output_error時のペナルティを設定
+            output_error_penalty_value = 0.0
+            if json_generation_failed:
+                output_error_penalty_cfg = getattr(cfg.env, "output_error_penalty", 1.0)
+                output_error_penalty_value = float(output_error_penalty_cfg)
+                if getattr(env, "debug", False):
+                    print(f"[reward_fn] output_errorペナルティ適用: -{output_error_penalty_value}")
 
             history_before = [dict(entry) for entry in env.logs]
             state_before = None
@@ -2377,8 +2384,10 @@ def main():
                 else:
                     is_stable_now = False
                 if is_stable_now:
-                    plan_text = '4'  # 介入しない
-                    plan_obj = {"intervene_now": False}
+                    # output_errorの場合はstrategyを保持
+                    if not json_generation_failed:
+                        plan_text = '4'  # 介入しない
+                        plan_obj = {"intervene_now": False}
             except Exception:
                 pass  # 安定チェックに失敗したら通常通り進める
 
@@ -2392,6 +2401,12 @@ def main():
             reward_details = info.get("reward_breakdown", {}) or {}
             components = _extract_reward_components(reward_details)
             total_reward = float(reward_value)
+            
+            # output_error_penaltyを減算
+            if output_error_penalty_value > 0:
+                total_reward -= output_error_penalty_value
+                components["output_errorペナルティ"] = -output_error_penalty_value
+            
             if components:
                 total_reward = sum(components.values())
 
@@ -2406,6 +2421,10 @@ def main():
                     reward_breakdown_formatted["時間ペナルティ"] = reward_details["time_penalty"]
                 if "terminal_bonus" in reward_details:
                     reward_breakdown_formatted["終了ボーナス"] = reward_details["terminal_bonus"]
+            
+            # output_errorペナルティを追加
+            if output_error_penalty_value > 0:
+                reward_breakdown_formatted["output_errorペナルティ"] = -output_error_penalty_value
 
             # componentsからも情報を補完（特に安定時のtime_penalty用）
             if components and not reward_breakdown_formatted:
@@ -2458,7 +2477,6 @@ def main():
                 "episode": env.episode,
                 "turn": env.t,
                 "done": bool(done),
-                "retry_count": retry_count,  # 再推論回数を記録
             }
 
             # interaction_id=1（最初のステップ）の場合のみepisode_info（話題・選択された地雷・地雷を持つペルソナ・話者過激度）を追加
@@ -2616,6 +2634,11 @@ def main():
                     # planが不正な場合でもintervene_nowを追加（デバッグ用）
                     if plan and isinstance(plan, dict):
                         intervention_info["intervene_now"] = plan.get("intervene_now", False)
+                        # 介入しない場合でもedge_to_changeとtarget_speakerを含める
+                        if "edge_to_change" in plan:
+                            intervention_info["edge_to_change"] = plan["edge_to_change"]
+                        if "target_speaker" in plan:
+                            intervention_info["target_speaker"] = plan["target_speaker"]
                     else:
                         # planがNoneまたは不正な場合はFalseとして扱う
                         intervention_info["intervene_now"] = False

@@ -4,7 +4,7 @@ import json
 from collections import defaultdict
 
 strategy_rewards = defaultdict(list)
-total_interventions = 0
+total_decisions = 0
 
 with open('app/logs/ppo_run-20251101-073508/conversation_summary.jsonl', 'r') as f:
     for line in f:
@@ -13,9 +13,10 @@ with open('app/logs/ppo_run-20251101-073508/conversation_summary.jsonl', 'r') as
         try:
             data = json.loads(line)
             if 'intervention' in data and isinstance(data['intervention'], dict):
-                if data['intervention'].get('intervened'):
-                    total_interventions += 1
-                    strategy = data['intervention'].get('strategy')
+                # Count all decisions (intervened=true or strategy present)
+                strategy = data['intervention'].get('strategy')
+                if data['intervention'].get('intervened') or strategy:
+                    total_decisions += 1
                     reward_data = data.get('reward', {})
                     if isinstance(reward_data, dict):
                         reward = reward_data.get('total', 0)
@@ -29,17 +30,17 @@ with open('app/logs/ppo_run-20251101-073508/conversation_summary.jsonl', 'r') as
             print(f"Error: {e}")
             pass
 
-print(f"Total interventions: {total_interventions}")
+print(f"Total decisions: {total_decisions}")
 print()
 
-for strategy in ['bridge', 'validate', 'plan']:
+for strategy in ['validate', 'bridge', 'plan', 'no_intervention', 'output_error']:
     rewards = strategy_rewards.get(strategy, [])
     if rewards:
         avg = sum(rewards) / len(rewards)
         positive = sum(1 for r in rewards if r > 0)
         negative = sum(1 for r in rewards if r < 0)
-        print(f"{strategy:10s}: n={len(rewards):3d} ({100*len(rewards)/total_interventions:.1f}%), "
+        print(f"{strategy:15s}: n={len(rewards):3d} ({100*len(rewards)/total_decisions:.1f}%), "
               f"avg={avg:+.3f}, min={min(rewards):+.3f}, max={max(rewards):+.3f}, "
               f"+:{positive}, -:{negative}")
     else:
-        print(f"{strategy:10s}: n=  0 (never selected)")
+        print(f"{strategy:15s}: n=  0 (never selected)")

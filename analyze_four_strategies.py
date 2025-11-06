@@ -43,17 +43,18 @@ def load_conversation_data(jsonl_path: Path) -> List[Dict]:
 
 def analyze_strategies(data: List[Dict]) -> Dict:
     """
-    4戦略の分析を実行
+    5戦略の分析を実行（validate, bridge, plan, no_intervention, output_error）
     
     Returns:
-        Dict with keys: 'validate', 'bridge', 'plan', 'no_intervention'
+        Dict with keys: 'validate', 'bridge', 'plan', 'no_intervention', 'output_error'
         Each value contains: count, total_reward, success_count, attempts
     """
     stats = {
         'validate': {'count': 0, 'total_reward': 0.0, 'success_count': 0, 'attempts': 0},
         'bridge': {'count': 0, 'total_reward': 0.0, 'success_count': 0, 'attempts': 0},
         'plan': {'count': 0, 'total_reward': 0.0, 'success_count': 0, 'attempts': 0},
-        'no_intervention': {'count': 0, 'total_reward': 0.0, 'success_count': 0, 'attempts': 0}
+        'no_intervention': {'count': 0, 'total_reward': 0.0, 'success_count': 0, 'attempts': 0},
+        'output_error': {'count': 0, 'total_reward': 0.0, 'success_count': 0, 'attempts': 0}
     }
     
     for entry in data:
@@ -69,12 +70,14 @@ def analyze_strategies(data: List[Dict]) -> Dict:
         # 戦略を決定
         if intervened:
             strategy = intervention.get('strategy', '').lower()
-            if strategy not in ['validate', 'bridge', 'plan']:
+            if strategy not in ['validate', 'bridge', 'plan', 'output_error']:
                 print(f"Warning: 未知の戦略 '{strategy}' (interaction_id={entry.get('interaction_id')})")
                 continue
         else:
-            # intervened: false の場合のみ介入なしとしてカウント
-            strategy = 'no_intervention'
+            # intervened: false の場合は、strategyを確認してno_interventionまたはoutput_errorを判定
+            strategy = intervention.get('strategy', 'no_intervention').lower()
+            if strategy not in ['no_intervention', 'output_error']:
+                strategy = 'output_error'
         
         # 関係性の変化をチェック
         relation_before = entry.get('relation', {})
@@ -128,17 +131,18 @@ def calculate_metrics(stats: Dict) -> Dict:
 def print_analysis(metrics: Dict, total_interactions: int):
     """分析結果を表示"""
     print("=" * 80)
-    print("4戦略分析結果 (validate, bridge, plan, 介入なし)")
+    print("5戦略分析結果 (validate, bridge, plan, no_intervention, output_error)")
     print("=" * 80)
     print()
     
     # 戦略の順序を定義
-    strategy_order = ['validate', 'bridge', 'plan', 'no_intervention']
+    strategy_order = ['validate', 'bridge', 'plan', 'no_intervention', 'output_error']
     strategy_labels = {
         'validate': 'VALIDATE',
         'bridge': 'BRIDGE',
         'plan': 'PLAN',
-        'no_intervention': '介入なし'
+        'no_intervention': '介入なし',
+        'output_error': 'OUTPUT_ERROR'
     }
     
     # サマリーテーブル
@@ -195,8 +199,8 @@ def main():
         'jsonl_path',
         type=str,
         nargs='?',
-        default='app/logs/ppo_run-20251105-115035/conversation_summary.jsonl',  #ここを変える
-        help='conversation_summary.jsonlのパス (デフォルト: ppo_run-20251105-115035)'
+        default='app/logs/ppo_run-20251105-193813/conversation_summary.jsonl',  #ここを変える
+        help='conversation_summary.jsonlのパス (デフォルト: ppo_run-20251105-193813)'
     )
     parser.add_argument(
         '--output',

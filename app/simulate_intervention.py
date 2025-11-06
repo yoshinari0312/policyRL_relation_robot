@@ -149,13 +149,13 @@ class InterventionSimulator:
 - その対象関係ペア（エッジ）
 が与えられます。
 
-あなたの目的は、このターゲットが含まれる関係（エッジ）を安定化状態（+++、+--、-+-、--+）へ近づけるために、最も効果的な介入戦略を選択することです。
+あなたの目的は、このターゲットが含まれる関係（エッジ）を安定化状態（+）へ近づけるために、最も効果的な介入戦略を選択することです。
 
 戦略の選択肢：
 1. validate — 対象者の感情や意見を承認し、心理的安全性を構築する。
 2. bridge — 対立する相手との共通点や協力の軸を見つけ、関係を再接続する。
 3. plan — 対象者に次の行動や方針を示し、前向きな関係改善を促す。
-4. no_intervention — まだ介入のタイミングではなく、自然な回復を見守る。
+4. no_intervention — 対立が軽度で、介入が逆効果になりそうなときや自然回復が見込める時に選ぶ。
 
 出力形式：
 - 数字1桁のみを出力してください（1, 2, 3, または 4）
@@ -232,11 +232,10 @@ class InterventionSimulator:
 あなたの目的は、このターゲットが含まれる関係（エッジ）をより安定(+)に近づけるために、「今この瞬間にどの戦略を選ぶことが最も効果的か」を判断することです。
 
 戦略の選択肢：
-4. no_intervention — 対立が軽度で、介入が逆効果になりそうなときや自然回復が見込める時に選ぶ。
-3. plan — 対象者に次の行動や方針を示し、前向きな関係改善を促す。
-2. bridge — 対立する相手との共通点や協力の軸を見つけ、関係を再接続する。
 1. validate — 対象者の感情や意見を承認し、心理的安全性を構築する。
-
+2. bridge — 対立する相手との共通点や協力の軸を見つけ、関係を再接続する。
+3. plan — 対象者に次の行動や方針を示し、前向きな関係改善を促す。
+4. no_intervention — 対立が軽度で、介入が逆効果になりそうなときや自然回復が見込める時に選ぶ。
 
 出力形式：
 - 数字1桁と理由のみを出力してください（1, 2, 3, 4）
@@ -245,15 +244,14 @@ class InterventionSimulator:
 - 与えられた入力情報に基づいて選択してください。
 
 出力例
-4,理由：〜
-3,理由：〜
-2,理由：〜
 1,理由：〜
+2,理由：〜
+3,理由：〜
+4,理由：〜
 """
         
-        # Qwen3モデルの場合のみ、\no_thinkを追加
-        if hasattr(self, 'model_name_or_path') and self.model_name_or_path and "Qwen3" in self.model_name_or_path:
-            system_content = "\\no_think\n" + system_content
+        # Note: Qwen3のthinkingモード無効化はapply_chat_templateのenable_thinking=Falseで制御
+        # ここではプロンプトに\no_thinkタグを追加しない
         
         # モデルのチャットテンプレートを使用
         messages = [
@@ -261,11 +259,20 @@ class InterventionSimulator:
             {"role": "user", "content": observation}
         ]
         
-        text = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
+        # Qwen3の場合のみenable_thinking=Falseを指定
+        if hasattr(self, 'model_name_or_path') and self.model_name_or_path and "Qwen3" in self.model_name_or_path:
+            text = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False
+            )
+        else:
+            text = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
         
         model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
         

@@ -37,13 +37,19 @@ class BatchSummaryCollector:
         intervene_now = plan_obj.get("intervene_now", False)
         self.choice_counts["intervene_now"][str(intervene_now)] += 1
 
-        # intervene_now=trueの場合のみ他の選択肢を記録
+        # strategyを常に記録（output_errorやno_interventionを含む）
+        strategy = plan_obj.get("strategy", None)
+        if strategy:
+            self.choice_counts["strategy"][strategy] += 1
+        elif not intervene_now:
+            # intervene_now=falseでstrategyがない場合はoutput_errorとして記録
+            self.choice_counts["strategy"]["output_error"] += 1
+
+        # intervene_now=trueの場合のみedgeとtargetを記録
         if intervene_now:
             edge = plan_obj.get("edge_to_change", "unknown")
-            strategy = plan_obj.get("strategy", "unknown")
             target = plan_obj.get("target_speaker", "unknown")
             self.choice_counts["edge_to_change"][edge] += 1
-            self.choice_counts["strategy"][strategy] += 1
             self.choice_counts["target_speaker"][target] += 1
     
     def get_strategy_distribution(self) -> Dict[str, int]:
