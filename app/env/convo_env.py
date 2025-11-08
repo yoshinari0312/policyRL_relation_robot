@@ -1269,24 +1269,26 @@ class ConversationEnv:
             strategy = strategy_map.get(strategy_num)
             if not strategy:
                 return None, "invalid_strategy_number", text
-            
-            if strategy == "no_intervention":
-                plan["intervene_now"] = False
-                return plan, None, None
-            
-            # 介入ありの場合
-            plan["intervene_now"] = True
-            plan["strategy"] = strategy
-            
+
             # edge_to_changeとtarget_speakerは_make_observationで既に選択済み
             # ※重要: ターゲット話者をここで再選択すると、LLMに提示した値と異なる値になる
             #   可能性があるため、_make_observationで選択した値を再利用する
             edge_to_change = getattr(self, '_current_target_edge', None)
             target_speaker = getattr(self, '_current_target_speaker', None)
-            
+
+            if strategy == "no_intervention":
+                plan["intervene_now"] = False
+                # 介入なしの場合でもedge_to_changeとtarget_speakerを記録（ログ出力用）
+                plan["edge_to_change"] = edge_to_change
+                plan["target_speaker"] = target_speaker
+                return plan, None, None
+
+            # 介入ありの場合
+            plan["intervene_now"] = True
+            plan["strategy"] = strategy
             plan["edge_to_change"] = edge_to_change
             plan["target_speaker"] = target_speaker
-            
+
             return plan, None, None
 
         # 旧形式（JSON）の処理（後方互換性）

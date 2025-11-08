@@ -71,6 +71,35 @@
 
 ## よく使うコマンド
 
+### 環境変数のセットアップ（初回のみ）
+
+機密情報（APIキー、エンドポイントなど）は `.env` ファイルで管理します。
+
+```bash
+# .env.example をコピー
+cp .env.example .env
+
+# .env を編集して実際の値を入力
+nano .env  # または vim, code など
+```
+
+**必須の環境変数**:
+- `AZURE_ENDPOINT`: Azure OpenAI のエンドポイントURL
+- `AZURE_API_KEY`: Azure OpenAI の APIキー
+- `WANDB_ENTITY`: Weights & Biases のユーザー名またはチーム名
+
+**推奨の環境変数**:
+- `AZURE_API_VERSION`: Azure OpenAI の APIバージョン（デフォルト: `2024-12-01-preview`）
+- `AZURE_MODEL`: デフォルトモデル名（デフォルト: `gpt-5-chat`）
+- `HUMAN_MODEL`, `RELATION_MODEL`, `ROBOT_MODEL`, `TOPIC_MODEL`, `INTERVENTION_MODEL`: 各用途別のモデル
+
+詳細は `.env.example` を参照してください。
+
+**注意**:
+- `.env` ファイルは `.gitignore` に含まれており、Gitにコミットされません
+- `config.local.yaml` は機密情報を含まないため、Gitにコミット可能です
+- 環境変数が設定されていない場合、`config.local.yaml` のデフォルト値が使用されます
+
 ### Docker セットアップ
 
 ```bash
@@ -140,16 +169,29 @@ python app/simulate_gpt5_intervention.py --quiet
 
 ### 設定
 
-すべての設定は`app/config.local.yaml`にあります。主要なセクション:
+設定は階層的に管理されています：
 
+1. **`.env` ファイル（最優先）**: 機密情報（APIキー、エンドポイントなど）
+2. **`app/config.local.yaml`**: 非機密の設定パラメータ（コミット可能）
+3. **`app/config.py`**: デフォルト値とバリデーション
+
+**設定の優先順位**:
+- `.env` ファイルの環境変数が最優先
+- `.env` に設定がない場合、`config.local.yaml` の値を使用
+- どちらにもない場合、`config.py` のデフォルト値を使用
+
+**`config.local.yaml` の主要なセクション**:
 - `env.*`: 環境設定（max_steps、報酬パラメータ、ペルソナの地雷）
 - `ppo.*`: PPOハイパーパラメータ（学習率、バッチサイズ、KL係数）
-- `llm.*`: Azure OpenAI設定（エンドポイント、APIキー、モデルデプロイメント）
+- `llm.*`: Azure OpenAI設定（機密情報は `.env` で設定）
 - `ollama.*`: Ollamaエンドポイント設定とモデル選択
 - `scorer.*`: 関係性スコアリングのバックエンドとパラメータ
-- `wandb.*`: Weights & Biases可視化設定
+- `wandb.*`: Weights & Biases可視化設定（エンティティは `.env` で設定）
 
-**注意**: `config.local.yaml`にはAPIキーが含まれています。このファイルは絶対にコミットしないでください。
+**注意**:
+- `config.local.yaml` は機密情報を含まないため、Gitにコミット可能です
+- 機密情報は必ず `.env` ファイルで管理してください
+- `.env` ファイルは `.gitignore` に含まれており、Gitにコミットされません
 
 ### 現在の設定値（2025-11-01時点）
 

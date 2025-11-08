@@ -15,6 +15,9 @@ services:
       - ./app:/workspace/app
       - ./models:/workspace/models
       - ./logs:/workspace/logs
+      - ./.env:/workspace/.env:ro  # .envファイルをマウント（読み取り専用）
+    env_file:
+      - .env  # .envファイルから環境変数を読み込む
     environment:
       # 全GPU（0-5）を使用
       - CUDA_VISIBLE_DEVICES=0,1,2,3,4,5

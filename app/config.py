@@ -8,6 +8,16 @@ try:
 except Exception:
     yaml = None
 
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    # .env ファイルを読み込む（プロジェクトルートから）
+    dotenv_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
+    load_dotenv(dotenv_path)
+except ImportError:
+    # dotenv がインストールされていない場合はスキップ
+    pass
+
 
 # ============ サブ設定 ============
 @dataclass
@@ -37,6 +47,16 @@ class LLMCfg:
     azure_model: Optional[str] = None
     azure_embedding_deployment: Optional[str] = None
     azure_embedding_api_version: Optional[str] = None
+    reasoning_effort: Optional[str] = None  # GPT-5のreasoningパラメータ
+    enable_reasoning_param: Optional[bool] = None  # reasoningパラメータを送信するか
+    max_attempts: Optional[int] = None  # リトライ回数
+    base_backoff: Optional[float] = None  # バックオフ時間
+    # 各LLM用の個別モデル設定
+    human_model: Optional[str] = None  # 人間ペルソナ用
+    relation_model: Optional[str] = None  # 関係性スコアリング用
+    robot_model: Optional[str] = None  # ロボット発話生成用
+    topic_model: Optional[str] = None  # 話題生成用
+    intervention_model: Optional[str] = None  # 介入判定用
 
 
 @dataclass
@@ -72,6 +92,7 @@ class EnvCfg:
     time_penalty: Optional[float] = None
     terminal_bonus: Optional[float] = None
     intervention_cost: Optional[float] = None
+    output_error_penalty: Optional[float] = None  # LLM出力失敗時のペナルティ
     min_robot_intervention_lookback: Optional[int] = None
     terminal_bonus_duration: Optional[int] = None
     max_auto_skip: Optional[int] = None
@@ -98,20 +119,32 @@ class PPOCfg:
     max_memory_map: Optional[Dict[Any, Any]] = None
     # HF transformers の device_map 戦略（"auto"/"balanced"/"balanced_low_0" 等）
     device_map_strategy: Optional[str] = None
+    ref_device: Optional[Any] = None  # 参照モデルを配置するデバイス
 
     # 学習ハイパラ（必要に応じて使用）
     lora_rank: Optional[int] = None
     lr: Optional[float] = None
+    lr_scheduler_type: Optional[str] = None  # 学習率スケジューラー: "constant", "linear", "cosine", "polynomial"
+    warmup_ratio: Optional[float] = None  # ウォームアップ期間
+    min_lr_ratio: Optional[float] = None  # 終了時の学習率（base_lrの比率）
     kl_coef: Optional[float] = None
     target_kl: Optional[float] = None
+    min_kl_coef: Optional[float] = None  # KL係数の下限
+    max_kl_coef: Optional[float] = None  # KL係数の上限
     kl_adjust_up: Optional[float] = None
     kl_adjust_down: Optional[float] = None
+    kl_lr_adjust_up: Optional[float] = None  # KL急上昇時のLR調整係数
+    kl_lr_adjust_down: Optional[float] = None  # KL低下時のLR調整係数
     cliprange: Optional[float] = None
     cliprange_value: Optional[float] = None
+    max_grad_norm: Optional[float] = None  # 勾配クリッピング
     decode_typical_p: Optional[float] = None
     decode_min_p: Optional[float] = None
     kl_estimator: Optional[str] = None  # KL推定器: "k1" or "k3"
     num_mini_batches: Optional[int] = None  # ミニバッチ数（更新の粒度）
+    vf_coef: Optional[float] = None  # 価値関数損失の係数
+    gamma: Optional[float] = None  # 割引率
+    lam: Optional[float] = None  # GAE lambda
 
     max_new_tokens: Optional[int] = None
     temperature: Optional[float] = None
@@ -128,6 +161,21 @@ class PPOCfg:
     entropy_patience: Optional[int] = None
     entropy_monitor_warmup: Optional[int] = None
     entropy_coef: Optional[float] = None
+
+    # エントロピー係数の自動制御
+    entropy_auto_adjust: Optional[bool] = None  # エントロピー係数の自動調整を有効化
+    entropy_target: Optional[float] = None  # 目標エントロピー
+    entropy_adjust_beta: Optional[float] = None  # 調整の強さ（β）
+    entropy_coef_initial: Optional[float] = None  # エントロピー係数の初期値
+    entropy_coef_min: Optional[float] = None  # エントロピー係数の最小値
+    entropy_coef_max: Optional[float] = None  # エントロピー係数の最大値
+
+    # 従来のフェーズ方式
+    entropy_coef_phase1: Optional[float] = None  # エントロピー係数（フェーズ1）
+    entropy_coef_phase2: Optional[float] = None  # エントロピー係数（フェーズ2）
+    entropy_coef_phase3: Optional[float] = None  # エントロピー係数（フェーズ3）
+    entropy_transition_updates: Optional[List[int]] = None  # エントロピー係数の変更タイミング
+    max_entropy_bonus: Optional[float] = None  # エントロピーボーナスの上限
     filter_zero_rewards: Optional[bool] = None
     whiten_rewards: Optional[bool] = None  # 報酬の正規化
     topic_overlap_weight: Optional[float] = None
@@ -290,10 +338,31 @@ def load_config(yaml_path: str = "config.local.yaml") -> AppConfig:
     if legacy_planner:
         llm_raw.setdefault("azure_endpoint", legacy_planner.get("endpoint"))
 
+    # 環境変数でYAMLの値を上書き（環境変数が優先）
+    llm_raw.setdefault("azure_endpoint", os.getenv("AZURE_ENDPOINT"))
+    llm_raw.setdefault("azure_api_key", os.getenv("AZURE_API_KEY"))
+    llm_raw.setdefault("azure_api_version", os.getenv("AZURE_API_VERSION"))
+    llm_raw.setdefault("azure_model", os.getenv("AZURE_MODEL"))
+    llm_raw.setdefault("azure_embedding_deployment", os.getenv("AZURE_EMBEDDING_DEPLOYMENT"))
+    llm_raw.setdefault("azure_embedding_api_version", os.getenv("AZURE_EMBEDDING_API_VERSION"))
+    llm_raw.setdefault("reasoning_effort", os.getenv("REASONING_EFFORT"))
+    if os.getenv("ENABLE_REASONING_PARAM"):
+        llm_raw["enable_reasoning_param"] = os.getenv("ENABLE_REASONING_PARAM").lower() in ("true", "1", "yes")
+    llm_raw.setdefault("human_model", os.getenv("HUMAN_MODEL"))
+    llm_raw.setdefault("relation_model", os.getenv("RELATION_MODEL"))
+    llm_raw.setdefault("robot_model", os.getenv("ROBOT_MODEL"))
+    llm_raw.setdefault("topic_model", os.getenv("TOPIC_MODEL"))
+    llm_raw.setdefault("intervention_model", os.getenv("INTERVENTION_MODEL"))
+
     llm = LLMCfg(**_filter_kwargs(LLMCfg, llm_raw))
     ppo = PPOCfg(**_filter_kwargs(PPOCfg, y.get("ppo")))
     topic_manager = TopicManagerCfg(**_filter_kwargs(TopicManagerCfg, y.get("topic_manager")))
-    wandb_cfg = WandbCfg(**_filter_kwargs(WandbCfg, y.get("wandb")))
+
+    # wandb設定も環境変数で上書き
+    wandb_dict = dict(y.get("wandb") or {})
+    wandb_dict.setdefault("entity", os.getenv("WANDB_ENTITY"))
+    wandb_dict.setdefault("project", os.getenv("WANDB_PROJECT"))
+    wandb_cfg = WandbCfg(**_filter_kwargs(WandbCfg, wandb_dict))
 
     app_cfg = AppConfig(env=env, scorer=scorer, ollama=ollama, llm=llm, ppo=ppo, topic_manager=topic_manager, wandb=wandb_cfg)
     _validate_required_fields(app_cfg)

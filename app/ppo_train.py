@@ -822,11 +822,11 @@ class TrainingRunLogger:
                     target_speaker = intervention.get("target_speaker", "")
                     decision_type = "intervention"
                 else:
-                    # 介入しなかった場合
+                    # 介入しなかった場合でもedge_to_changeとtarget_speakerを記録
                     strategy = "no_intervention"
-                    edge = "none"
+                    edge = intervention.get("edge_to_change", "none")
                     robot_utterance = ""
-                    target_speaker = ""
+                    target_speaker = intervention.get("target_speaker", "")
                     decision_type = "no_intervention"
 
                 # 関係性情報
@@ -1333,13 +1333,43 @@ def _create_train_method_with_entropy_bonus(get_reward_fn=None):
                                 else:
                                     mean_entropy = torch.tensor(0.0, device=target_device)
                                 
-                                # エントロピー係数のスケジューリング（update数に応じて減衰）
-                                if update <= getattr(self, 'entropy_transition_updates', [20, 60])[0]:
-                                    current_entropy_coef = getattr(self, 'entropy_coef_phase1', 0.03)
-                                elif update <= getattr(self, 'entropy_transition_updates', [20, 60])[1]:
-                                    current_entropy_coef = getattr(self, 'entropy_coef_phase2', 0.02)
+                                # エントロピー係数のスケジューリング
+                                if getattr(self, 'entropy_auto_adjust', False):
+                                    # 自動調整モード: α ← α * exp(β*(H_target - H_observed))
+                                    # 初回のみ初期値を設定
+                                    if not hasattr(self, 'current_entropy_coef_dynamic'):
+                                        self.current_entropy_coef_dynamic = self.custom_entropy_coef
+
+                                    # 観測エントロピーに基づいて係数を更新
+                                    H_observed = mean_entropy.item()
+                                    H_target = getattr(self, 'entropy_target', 0.7)
+                                    beta = getattr(self, 'entropy_adjust_beta', 0.05)
+
+                                    # α ← α * exp(β*(H_target - H_observed))
+                                    import math
+                                    adjustment_factor = math.exp(beta * (H_target - H_observed))
+                                    new_coef = self.current_entropy_coef_dynamic * adjustment_factor
+
+                                    # クリップ
+                                    new_coef = max(self.entropy_coef_min, min(new_coef, self.entropy_coef_max))
+
+                                    # 更新（次回のバッチで使用）
+                                    old_coef = self.current_entropy_coef_dynamic
+                                    self.current_entropy_coef_dynamic = new_coef
+                                    current_entropy_coef = old_coef  # 今回は更新前の係数を使用
+
+                                    # デバッグログ（最初のミニバッチのみ）
+                                    if gradient_accumulation_idx == 0 and minibatch_idx == 0 and ppo_epoch_idx == 0:
+                                        accelerator.print(f"[ENTROPY_AUTO_ADJUST] update={update} H_obs={H_observed:.4f} H_target={H_target:.4f} " +
+                                                         f"factor={adjustment_factor:.4f} coef: {old_coef:.5f} -> {new_coef:.5f}")
                                 else:
-                                    current_entropy_coef = getattr(self, 'entropy_coef_phase3', 0.01)
+                                    # フェーズベースモード（従来の方式）
+                                    if update <= getattr(self, 'entropy_transition_updates', [20, 60])[0]:
+                                        current_entropy_coef = getattr(self, 'entropy_coef_phase1', 0.03)
+                                    elif update <= getattr(self, 'entropy_transition_updates', [20, 60])[1]:
+                                        current_entropy_coef = getattr(self, 'entropy_coef_phase2', 0.02)
+                                    else:
+                                        current_entropy_coef = getattr(self, 'entropy_coef_phase3', 0.01)
 
                                 entropy_bonus = current_entropy_coef * mean_entropy
                                 
@@ -1362,27 +1392,38 @@ def _create_train_method_with_entropy_bonus(get_reward_fn=None):
                                     mean_entropy_val = mean_entropy.item()
                                     entropy_bonus_val = entropy_bonus.item()
                                     loss_after_val = loss.item()
-                                    
+
                                     # コンソール出力
                                     accelerator.print(f"[ENTROPY_BONUS] update={update} mean_entropy={mean_entropy_val:.4f} bonus={entropy_bonus_val:.4f} (coef={current_entropy_coef:.3f}) loss: {loss_before:.4f} -> {loss_after_val:.4f}")
-                                    
+
+                                    # ログメトリクスの基本セット
+                                    log_metrics = {
+                                        "train/entropy/mean": mean_entropy_val,
+                                        "train/entropy/bonus": entropy_bonus_val,
+                                        "train/entropy/coef": current_entropy_coef,
+                                        "train/loss/before_entropy": loss_before,
+                                        "train/loss/after_entropy": loss_after_val,
+                                    }
+
+                                    # 自動調整モードの場合、追加情報をログ
+                                    if getattr(self, 'entropy_auto_adjust', False):
+                                        log_metrics.update({
+                                            "train/entropy/target": getattr(self, 'entropy_target', 0.7),
+                                            "train/entropy/next_coef": getattr(self, 'current_entropy_coef_dynamic', current_entropy_coef),
+                                            "train/entropy/coef_delta": getattr(self, 'current_entropy_coef_dynamic', current_entropy_coef) - current_entropy_coef,
+                                        })
+
                                     # Trainerのログ経路に記録（metrics.jsonl + wandb自動連携）
                                     try:
-                                        self.log({
-                                            "train/entropy/mean": mean_entropy_val,
-                                            "train/entropy/bonus": entropy_bonus_val,
-                                            "train/entropy/coef": current_entropy_coef,
-                                            "train/loss/before_entropy": loss_before,
-                                            "train/loss/after_entropy": loss_after_val,
-                                        })
+                                        self.log(log_metrics)
                                     except Exception as log_err:
                                         accelerator.print(f"[ENTROPY_BONUS] self.log failed: {log_err}")
-                                    
+
                                     # wandbに直接記録（フォールバック）
                                     try:
                                         import wandb
                                         if wandb.run is not None:
-                                            wandb.log({
+                                            wandb_metrics = {
                                                 "entropy/mean_entropy": mean_entropy_val,
                                                 "entropy/bonus": entropy_bonus_val,
                                                 "entropy/coef": current_entropy_coef,
@@ -1390,7 +1431,17 @@ def _create_train_method_with_entropy_bonus(get_reward_fn=None):
                                                 "entropy/loss_after": loss_after_val,
                                                 "entropy/loss_reduction": loss_before - loss_after_val,
                                                 "ppo/update": update,
-                                            })  # stepを指定しない → Trainerの現在stepに自動追従
+                                            }
+
+                                            # 自動調整モードの場合、追加情報をログ
+                                            if getattr(self, 'entropy_auto_adjust', False):
+                                                wandb_metrics.update({
+                                                    "entropy/target": getattr(self, 'entropy_target', 0.7),
+                                                    "entropy/next_coef": getattr(self, 'current_entropy_coef_dynamic', current_entropy_coef),
+                                                    "entropy/coef_delta": getattr(self, 'current_entropy_coef_dynamic', current_entropy_coef) - current_entropy_coef,
+                                                })
+
+                                            wandb.log(wandb_metrics)  # stepを指定しない → Trainerの現在stepに自動追従
                                     except Exception as wandb_err:
                                         accelerator.print(f"[ENTROPY_BONUS] wandb log failed: {wandb_err}")
                                     
@@ -1505,7 +1556,7 @@ def _create_train_method_with_entropy_bonus(get_reward_fn=None):
 
 class PPOTrainerWithEntropyBonus(PPOTrainer):
     """
-    エントロピーボーナスを損失に追加するカスタムPPOTrainer
+    エントロピーボーナスを損失に追加し、KL発散に基づいて学習率とKL係数を自動調整するカスタムPPOTrainer
     
     標準的なPPO実装:
         loss = policy_loss + vf_coef * value_loss
@@ -1513,17 +1564,104 @@ class PPOTrainerWithEntropyBonus(PPOTrainer):
     この実装:
         loss = policy_loss + vf_coef * value_loss - entropy_coef * entropy
         
-    これにより、方策が探索的になることを奨励します。
+    さらに、KL発散に基づいて自動調整:
+        - KL > 1.5×target → kl_coef *= kl_adjust_up, lr *= lr_adjust_up (0.9)
+        - KL < 0.5×target → kl_coef *= kl_adjust_down, lr *= lr_adjust_down (1.1)
     """
     
-    def __init__(self, *args, entropy_coef: float = 0.0, **kwargs):
+    def __init__(self, *args, entropy_coef: float = 0.0,
+                 kl_adjust_up: float = 1.3, kl_adjust_down: float = 0.9,
+                 min_kl_coef: float = 0.01, max_kl_coef: float = 1.0,
+                 kl_lr_adjust_up: float = 0.9, kl_lr_adjust_down: float = 1.1,
+                 base_lr: float = 1e-5,
+                 # エントロピー係数の自動調整パラメータ
+                 entropy_auto_adjust: bool = False,
+                 entropy_target: float = 0.7,
+                 entropy_adjust_beta: float = 0.05,
+                 entropy_coef_min: float = 0.001,
+                 entropy_coef_max: float = 0.2,
+                 **kwargs):
         super().__init__(*args, **kwargs)
         self.custom_entropy_coef = float(entropy_coef)
+
+        # KL自動調整パラメータ
+        self.kl_adjust_up = float(kl_adjust_up)
+        self.kl_adjust_down = float(kl_adjust_down)
+        self.min_kl_coef = float(min_kl_coef)
+        self.max_kl_coef = float(max_kl_coef)
+        self.kl_lr_adjust_up = float(kl_lr_adjust_up)
+        self.kl_lr_adjust_down = float(kl_lr_adjust_down)
+        self.base_lr = float(base_lr)
+
+        # エントロピー係数の自動調整パラメータ
+        self.entropy_auto_adjust = bool(entropy_auto_adjust)
+        self.entropy_target = float(entropy_target)
+        self.entropy_adjust_beta = float(entropy_adjust_beta)
+        self.entropy_coef_min = float(entropy_coef_min)
+        self.entropy_coef_max = float(entropy_coef_max)
+
         if self.custom_entropy_coef > 0:
             print(f"[PPOTrainerWithEntropyBonus] custom_entropy_coef={self.custom_entropy_coef} ENABLED", flush=True)
             print(f"[PPOTrainerWithEntropyBonus] Will subtract entropy_coef * entropy from loss", flush=True)
         else:
             print(f"[PPOTrainerWithEntropyBonus] custom_entropy_coef={self.custom_entropy_coef} DISABLED", flush=True)
+
+        if self.entropy_auto_adjust:
+            print(f"[ENTROPY_AUTO_ADJUST] ENABLED", flush=True)
+            print(f"[ENTROPY_AUTO_ADJUST] target={self.entropy_target}, beta={self.entropy_adjust_beta}", flush=True)
+            print(f"[ENTROPY_AUTO_ADJUST] range=[{self.entropy_coef_min}, {self.entropy_coef_max}]", flush=True)
+        else:
+            print(f"[ENTROPY_AUTO_ADJUST] DISABLED (using phase-based method)", flush=True)
+
+        print(f"[KL Auto-Adjust] kl_adjust_up={self.kl_adjust_up}, kl_adjust_down={self.kl_adjust_down}", flush=True)
+        print(f"[KL Auto-Adjust] min_kl_coef={self.min_kl_coef}, max_kl_coef={self.max_kl_coef}", flush=True)
+        print(f"[KL Auto-Adjust] lr_adjust_up={self.kl_lr_adjust_up}, lr_adjust_down={self.kl_lr_adjust_down}", flush=True)
+    
+    def adjust_kl_and_lr(self, kl_value: float):
+        """
+        KL発散に基づいてkl_coefと学習率を自動調整
+
+        Args:
+            kl_value: 現在のKL発散値
+
+        Returns:
+            tuple: (adjusted_kl_coef, adjusted_lr, adjustment_reason)
+        """
+        target_kl = self.args.target_kl
+        current_kl_coef = self.args.kl_coef
+        current_lr = self.optimizer.param_groups[0]['lr']
+
+        adjustment_reason = "no_change"
+
+        # KL > 1.5×target → kl_coef増加、LR減少
+        if kl_value > 1.5 * target_kl:
+            new_kl_coef = min(current_kl_coef * self.kl_adjust_up, self.max_kl_coef)
+            new_lr = max(current_lr * self.kl_lr_adjust_up, 1e-8)  # 最小値保護
+            adjustment_reason = f"kl_too_high (KL={kl_value:.4f} > 1.5×{target_kl:.4f})"
+
+            if new_kl_coef != current_kl_coef or new_lr != current_lr:
+                self.args.kl_coef = new_kl_coef
+                for param_group in self.optimizer.param_groups:
+                    param_group['lr'] = new_lr
+                print(f"[KL Auto-Adjust] {adjustment_reason}", flush=True)
+                print(f"  kl_coef: {current_kl_coef:.6f} → {new_kl_coef:.6f}", flush=True)
+                print(f"  lr: {current_lr:.6e} → {new_lr:.6e}", flush=True)
+
+        # KL < 0.5×target → kl_coef減少、LR増加（上限=base_lr）
+        elif kl_value < 0.5 * target_kl:
+            new_kl_coef = max(current_kl_coef * self.kl_adjust_down, self.min_kl_coef)
+            new_lr = min(current_lr * self.kl_lr_adjust_down, self.base_lr)
+            adjustment_reason = f"kl_too_low (KL={kl_value:.4f} < 0.5×{target_kl:.4f})"
+
+            if new_kl_coef != current_kl_coef or new_lr != current_lr:
+                self.args.kl_coef = new_kl_coef
+                for param_group in self.optimizer.param_groups:
+                    param_group['lr'] = new_lr
+                print(f"[KL Auto-Adjust] {adjustment_reason}", flush=True)
+                print(f"  kl_coef: {current_kl_coef:.6f} → {new_kl_coef:.6f}", flush=True)
+                print(f"  lr: {current_lr:.6e} → {new_lr:.6e}", flush=True)
+
+        return self.args.kl_coef, self.optimizer.param_groups[0]['lr'], adjustment_reason
 
 # train()メソッドは main() 内でパッチ（get_rewardのパッチ後に適用する必要があるため）
 # try:
@@ -2122,14 +2260,33 @@ def main():
     print(f"[PPO_CONFIG] per_device_train_batch_size (YAML) = {_per_device_bs}")
     print(f"[PPO_CONFIG] grad_accum_steps (YAML)    = {_ga}")
     print(f"[PPO_CONFIG] ppo_epochs (YAML)          = {_epochs}")
+    
+    # KL関連パラメータ
     _kl    = max(0.0, kl_coef_value)
     _target_kl = max(0.0, _to_float(getattr(ppo_cfg, "target_kl", 0.02), 0.02))
+    _min_kl_coef = max(0.0, _to_float(getattr(ppo_cfg, "min_kl_coef", 0.01), 0.01))
+    _max_kl_coef = max(_kl, _to_float(getattr(ppo_cfg, "max_kl_coef", 1.0), 1.0))
     _kl_adjust_up = _to_float(getattr(ppo_cfg, "kl_adjust_up", 1.3), 1.3)
     if (not math.isfinite(_kl_adjust_up)) or _kl_adjust_up <= 1.0:
         _kl_adjust_up = 1.3
     _kl_adjust_down = _to_float(getattr(ppo_cfg, "kl_adjust_down", 0.9), 0.9)
     if (not math.isfinite(_kl_adjust_down)) or not (0.0 < _kl_adjust_down < 1.0):
         _kl_adjust_down = 0.9
+    
+    # LR調整パラメータ
+    _kl_lr_adjust_up = _to_float(getattr(ppo_cfg, "kl_lr_adjust_up", 0.9), 0.9)
+    _kl_lr_adjust_down = _to_float(getattr(ppo_cfg, "kl_lr_adjust_down", 1.1), 1.1)
+    _base_lr = _lr  # 元の学習率を保存（上限として使用）
+    
+    # 学習率スケジューラー関連
+    _lr_scheduler_type = str(getattr(ppo_cfg, "lr_scheduler_type", "constant"))
+    _warmup_ratio = _to_float(getattr(ppo_cfg, "warmup_ratio", 0.0), 0.0)
+
+    # [DEBUG] スケジューラー設定をログ出力
+    print(f"[PPO_CONFIG] lr_scheduler_type (読込後) = {_lr_scheduler_type}")
+    print(f"[PPO_CONFIG] warmup_ratio = {_warmup_ratio}")
+    print(f"[PPO_CONFIG] ppo_cfg.lr_scheduler_type = {getattr(ppo_cfg, 'lr_scheduler_type', 'NOT_FOUND')}")
+    
     _cliprange = max(0.0, _to_float(getattr(ppo_cfg, "cliprange", 0.2), 0.2))
     _cliprange_value = max(0.0, _to_float(getattr(ppo_cfg, "cliprange_value", 0.2), 0.2))
     _max_grad_norm = max(0.0, _to_float(getattr(ppo_cfg, "max_grad_norm", 1.0), 1.0))
@@ -2142,6 +2299,19 @@ def main():
         _kl_estimator = "k1"
     _num_mini_batches = _to_int(getattr(ppo_cfg, "num_mini_batches", 1), 1)
     _entropy_coef = max(0.0, _to_float(getattr(ppo_cfg, "entropy_coef", 0.01), 0.01))
+
+    # === エントロピー係数の自動調整パラメータ ===
+    _entropy_auto_adjust = bool(getattr(ppo_cfg, "entropy_auto_adjust", False))
+    _entropy_target = _to_float(getattr(ppo_cfg, "entropy_target", 0.7), 0.7)
+    _entropy_adjust_beta = _to_float(getattr(ppo_cfg, "entropy_adjust_beta", 0.05), 0.05)
+    _entropy_coef_initial = _to_float(getattr(ppo_cfg, "entropy_coef_initial", 0.05), 0.05)
+    _entropy_coef_min = max(0.0, _to_float(getattr(ppo_cfg, "entropy_coef_min", 0.001), 0.001))
+    _entropy_coef_max = _to_float(getattr(ppo_cfg, "entropy_coef_max", 0.2), 0.2)
+
+    # 自動調整が有効な場合、_entropy_coefを初期値で上書き
+    if _entropy_auto_adjust:
+        _entropy_coef = _entropy_coef_initial
+        print(f"[ENTROPY_AUTO_ADJUST] Using initial coef: {_entropy_coef}", flush=True)
 
     # === PPOConfig（TRL 0.23 互換の安全パラメータ）====
     # TRLのバージョンによってはent_coefが存在しない場合があるため、条件付きで設定
@@ -2160,18 +2330,29 @@ def main():
         "max_grad_norm": _max_grad_norm,          # 勾配クリッピング（安定性向上）
         "whiten_rewards": _whiten_rewards,        # 報酬の正規化（平均0、標準偏差1に変換）
         "ds3_gather_for_generation": True,        # ZeRO-3 を使う場合の最適化（使ってなければ無害）
-        "lr_scheduler_type": "constant",          # 学習率を一定に保つ（デフォルトの"linear"は0に減衰する）
-        "warmup_steps": 0,                        # ウォームアップなし（すぐに full lr で学習開始）
+        "lr_scheduler_type": _lr_scheduler_type,  # 学習率スケジューラー
+        "warmup_ratio": _warmup_ratio,            # ウォームアップ期間
     }
-    
+
+    # 注: transformersの標準cosineスケジューラーは最小値=0に固定されており、
+    # eta_minをサポートしていません。カスタムスケジューラーはTrainer初期化後に設定します。
+
     # TRLのバージョンによってent_coefが存在しない場合があるため、
     # PPOTrainerWithEntropyBonusのカスタム実装を使用
     # （ent_coefがサポートされている場合でも、カスタム実装を使うことで一貫性を保つ）
-    
+
     ppo_config = PPOConfig(**ppo_config_kwargs)
     ppo_config.target_kl = _target_kl
-    ppo_config.kl_adjust_up = _kl_adjust_up
-    ppo_config.kl_adjust_down = _kl_adjust_down
+
+    # [FIX] PPOConfig初期化後に値が上書きされることがあるため、明示的に再設定
+    if ppo_config.lr_scheduler_type != _lr_scheduler_type:
+        print(f"[PPO_CONFIG] WARNING: lr_scheduler_type was changed from '{_lr_scheduler_type}' to '{ppo_config.lr_scheduler_type}' during PPOConfig init")
+        print(f"[PPO_CONFIG] Forcing lr_scheduler_type back to '{_lr_scheduler_type}'")
+        ppo_config.lr_scheduler_type = _lr_scheduler_type
+
+    # Note: kl_adjust_up/kl_adjust_downは公式パラメータではないため、
+    # カスタムロジックで実装（後述）
+    
     # 生成の終端
     ppo_config.stop_token_id = tokenizer.eos_token_id
     # 1 デバイス当たりのバッチサイズ（Accelerate の world size 計算と整合させる）
@@ -2210,10 +2391,17 @@ def main():
     enable_wandb = getattr(cfg.wandb, "enabled", True) if hasattr(cfg, "wandb") else True
     training_logger = TrainingRunLogger(run_log_dir, enable_wandb=enable_wandb)
 
+    # 実効バッチサイズを計算（table_log_frequency用）
+    _effective_batch_size = _per_device_bs * _ga * 2
+
     # wandb設定をTrainingRunLoggerに反映
     if hasattr(cfg, "wandb") and cfg.wandb:
         if hasattr(cfg.wandb, "table_log_frequency") and cfg.wandb.table_log_frequency:
             training_logger._table_log_frequency = int(cfg.wandb.table_log_frequency)
+        else:
+            # 設定がない場合は実効バッチサイズと同じにする
+            training_logger._table_log_frequency = _effective_batch_size
+            print(f"[WANDB] table_log_frequency auto-set to batch_size: {_effective_batch_size}")
     training_logger.write_json("config.json", dataclasses.asdict(cfg))
     training_logger.log_event(event="run_start", run_id=run_id)
 
@@ -2233,6 +2421,24 @@ def main():
     # effective_batch_size = per_device_train_batch_size × grad_accum_steps × 2
     total_updates = _to_int(getattr(ppo_cfg, "total_updates", 50), 50)
     effective_batch_size = _per_device_bs * _ga * 2
+
+    # entropy_transition_updatesを処理（割合 → 絶対値）
+    entropy_transition_raw = getattr(ppo_cfg, "entropy_transition_updates", [0.1, 0.3])
+    if entropy_transition_raw and isinstance(entropy_transition_raw, list):
+        entropy_transition_updates = []
+        for val in entropy_transition_raw:
+            if 0.0 < val < 1.0:
+                # 割合として扱う（0.0-1.0）
+                absolute_val = int(val * total_updates)
+                entropy_transition_updates.append(absolute_val)
+            else:
+                # 絶対値として扱う（後方互換性）
+                entropy_transition_updates.append(int(val))
+        print(f"[PPO] entropy_transition_updates: {entropy_transition_raw} → {entropy_transition_updates} (total_updates={total_updates})")
+    else:
+        # デフォルト値
+        entropy_transition_updates = [int(0.1 * total_updates), int(0.3 * total_updates)]
+        print(f"[PPO] entropy_transition_updates (default): {entropy_transition_updates} (total_updates={total_updates})")
     total_samples = total_updates * max(1, effective_batch_size)
     train_ds = FiniteOnlineDataset(
         tokenizer, env, build_robot_messages,
@@ -2295,11 +2501,15 @@ def main():
 
     # バッチサマリーコレクターは後でTrainer作成後に初期化（実効バッチサイズ使用）
     batch_collector = None  # 一時的にNone、Trainer作成後に初期化
+    
+    # KL係数と学習率の追跡用（batch_summary記録のため）
+    current_kl_coef_tracker = {"value": _kl}
+    current_lr_tracker = {"value": _lr}
 
     # 報酬関数：生成テキストを環境に流し込み、Before→After のスコア差を返す
     # PPOTrainer 0.23 では `reward_model` 経由の計算が前提のため、後段で monkeypatch して利用する
     def reward_fn(samples, **kwargs):
-        nonlocal batch_collector
+        nonlocal batch_collector, current_kl_coef_tracker, current_lr_tracker
         rewards: List[float] = []
 
         def _extract_plan_candidate(text: str) -> str:
@@ -2341,6 +2551,8 @@ def main():
                 # 有効な数字が得られた
                 plan_text = candidate_plan_text
                 plan_obj = validated_plan_obj
+                # 介入判定LLMの生出力を記録
+                plan_obj["_llm_raw_output"] = final_raw_resp
             else:
                 # 検証失敗: output_errorとして扱う
                 plan_text = 'output_error'
@@ -2348,12 +2560,13 @@ def main():
                     "intervene_now": False,
                     "strategy": "output_error",
                     "edge_to_change": getattr(env, '_current_target_edge', None),
-                    "target_speaker": getattr(env, '_current_target_speaker', None)
+                    "target_speaker": getattr(env, '_current_target_speaker', None),
+                    "_llm_raw_output": final_raw_resp  # エラー時も生出力を記録
                 }
                 json_generation_failed = True  # 生成失敗フラグ
                 if getattr(env, "debug", False):
                     print(f"[reward_fn] output_error検出: {candidate_plan_text[:100] if candidate_plan_text else 'None'}...")
-            
+
             # JSON生成が成功した場合のフラグ
             if 'json_generation_failed' not in locals():
                 json_generation_failed = False
@@ -2373,23 +2586,8 @@ def main():
             except Exception:
                 state_before = None
 
-            # 安定状態の場合は介入判定をスキップ（フォールバック）
-            # 注: 通常は__iter__()でスキップされるため、ここに到達するのは不安定なターンのみ
-            is_stable_now = False
-            try:
-                current_rel = env.relation_snapshot()
-                if isinstance(current_rel, dict):
-                    metrics = current_rel.get("metrics", current_rel)
-                    is_stable_now = metrics.get("unstable_triads", 0) == 0
-                else:
-                    is_stable_now = False
-                if is_stable_now:
-                    # output_errorの場合はstrategyを保持
-                    if not json_generation_failed:
-                        plan_text = '4'  # 介入しない
-                        plan_obj = {"intervene_now": False}
-            except Exception:
-                pass  # 安定チェックに失敗したら通常通り進める
+            # 注: 安定状態の自動スキップはenv側で実装されている（filter_zero_rewards）
+            # ppo_train.py側で再度チェックすると、LLMの出力と実際の行動が矛盾する原因となる
 
             # 選択肢をバッチコレクターに記録
             if plan_obj and batch_collector is not None:
@@ -2398,6 +2596,20 @@ def main():
             interaction_id = next(interaction_counter)
 
             next_obs, reward_value, done, info = env.step(plan_text)
+
+            # plan_obj（LLMの生出力を含む）をinfoに上書き
+            # env.step()はenv内部で作成したplanを返すが、それには_llm_raw_outputが含まれていない
+            if plan_obj and isinstance(plan_obj, dict):
+                # env内部のplanとマージ（env側の情報も保持）
+                env_plan = info.get("plan", {})
+                if isinstance(env_plan, dict):
+                    # env側の情報を優先しつつ、plan_objの_llm_raw_outputを追加
+                    merged_plan = {**env_plan, **plan_obj}
+                    info["plan"] = merged_plan
+                else:
+                    # env側のplanが不正な場合はplan_objを使用
+                    info["plan"] = plan_obj
+
             reward_details = info.get("reward_breakdown", {}) or {}
             components = _extract_reward_components(reward_details)
             total_reward = float(reward_value)
@@ -2409,6 +2621,10 @@ def main():
             
             if components:
                 total_reward = sum(components.values())
+
+            # バッチコレクターに報酬を記録
+            if batch_collector is not None:
+                batch_collector.add_reward(total_reward)
 
             # 報酬詳細を整形（reward_detailsとcomponentsの両方から情報を取得）
             reward_breakdown_formatted = {}
@@ -2461,15 +2677,6 @@ def main():
             plan_error = info.get("plan_error")
             if plan_error:
                 episode_stats[current_episode_id]["plan_error_count"] += 1
-
-            # バッチコレクターにステップを記録
-            if batch_collector is not None:
-                batch_collector.add_step(
-                    reward=total_reward,
-                    intervened=info.get("intervened", False),
-                    is_stable_before=is_stable_before,
-                    plan_error=bool(plan_error)
-                )
 
             # 会話の流れを整理: 介入前 → 介入 → evaluation_horizon後 → bonus確認後
             log_payload: Dict[str, Any] = {
@@ -2580,6 +2787,9 @@ def main():
                             intervention_info["edge_to_change"] = plan["edge_to_change"]
                         if "target_speaker" in plan:
                             intervention_info["target_speaker"] = plan["target_speaker"]
+                        # 介入判定LLMの生出力を記録
+                        if "_llm_raw_output" in plan:
+                            intervention_info["llm_raw_output"] = plan["_llm_raw_output"]
 
                     # evaluation_horizon + terminal_bonus_duration中の人間発話を抽出
                     replies = info.get("replies", [])
@@ -2639,6 +2849,9 @@ def main():
                             intervention_info["edge_to_change"] = plan["edge_to_change"]
                         if "target_speaker" in plan:
                             intervention_info["target_speaker"] = plan["target_speaker"]
+                        # 介入判定LLMの生出力を記録（介入しなかった場合も）
+                        if "_llm_raw_output" in plan:
+                            intervention_info["llm_raw_output"] = plan["_llm_raw_output"]
                     else:
                         # planがNoneまたは不正な場合はFalseとして扱う
                         intervention_info["intervene_now"] = False
@@ -2684,7 +2897,15 @@ def main():
 
             # --- バッチ判定: intervention-decision ベース ---
             if batch_collector is not None and batch_collector.is_batch_ready():
-                batch_summary = batch_collector.get_summary()
+                # 最新の学習率を取得（trainer経由で直接取得）
+                latest_lr = _lr
+                if hasattr(trainer, 'optimizer') and trainer.optimizer:
+                    latest_lr = trainer.optimizer.param_groups[0]['lr']
+
+                batch_summary = batch_collector.get_summary(
+                    kl_coef=current_kl_coef_tracker.get("value"),
+                    current_lr=latest_lr
+                )
                 training_logger.log_batch_summary(
                     batch_summary=batch_summary,
                     episode=env.episode,
@@ -2952,7 +3173,27 @@ def main():
         value_model=getattr(policy, "pretrained_model", policy),
         data_collator=ppo_collator,           # ← これが重要
         entropy_coef=_entropy_coef,           # カスタムパラメータ
+        # KL自動調整パラメータ
+        kl_adjust_up=_kl_adjust_up,
+        kl_adjust_down=_kl_adjust_down,
+        min_kl_coef=_min_kl_coef,
+        max_kl_coef=_max_kl_coef,
+        kl_lr_adjust_up=_kl_lr_adjust_up,
+        kl_lr_adjust_down=_kl_lr_adjust_down,
+        base_lr=_base_lr,
+        # エントロピー係数の自動調整パラメータ
+        entropy_auto_adjust=_entropy_auto_adjust,
+        entropy_target=_entropy_target,
+        entropy_adjust_beta=_entropy_adjust_beta,
+        entropy_coef_min=_entropy_coef_min,
+        entropy_coef_max=_entropy_coef_max,
     )
+
+    # entropy_transition_updatesとphase別係数をtrainerに設定
+    trainer.entropy_transition_updates = entropy_transition_updates
+    trainer.entropy_coef_phase1 = _to_float(getattr(ppo_cfg, "entropy_coef_phase1", 0.05), 0.05)
+    trainer.entropy_coef_phase2 = _to_float(getattr(ppo_cfg, "entropy_coef_phase2", 0.03), 0.03)
+    trainer.entropy_coef_phase3 = _to_float(getattr(ppo_cfg, "entropy_coef_phase3", 0.01), 0.01)
 
     # 実効バッチサイズ = per_device_train_batch_size × grad_accum_steps × 2
     effective_batch_size = ppo_config.per_device_train_batch_size * _ga * 2
@@ -2970,12 +3211,57 @@ def main():
     print(f"[TRAINER_DEBUG] training_logger available: {training_logger is not None}", flush=True)
     print(f"[TRAINER_DEBUG] training_logger type: {type(training_logger)}", flush=True)
 
-    # 学習率スケジューラーの確認
-    if hasattr(trainer, 'lr_scheduler') and trainer.lr_scheduler is not None:
-        current_lr = trainer.lr_scheduler.get_last_lr()[0] if hasattr(trainer.lr_scheduler, 'get_last_lr') else _lr
-        print(f"[PPO] Optimizer learning rate: {current_lr}, scheduler type: {ppo_config.lr_scheduler_type}")
-    else:
-        print(f"[PPO] No lr_scheduler found, using base learning rate: {_lr}")
+    class KLAutoAdjustCallback(TrainerCallback):
+        """KL発散に基づいてkl_coefと学習率を自動調整"""
+        def __init__(self, trainer, kl_tracker, lr_tracker, training_logger=None):
+            self.trainer = trainer
+            self.kl_tracker = kl_tracker
+            self.lr_tracker = lr_tracker
+            self.training_logger = training_logger
+            self.update_count = 0
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if logs is None:
+                return control
+
+            # KL値を取得（train/policy/approxkl_avgを優先、target_klはこれの目安）
+            kl_value = logs.get("policy/approxkl_avg") or logs.get("objective/kl")
+
+            if kl_value is not None and hasattr(self.trainer, 'adjust_kl_and_lr'):
+                self.update_count += 1
+
+                # KL調整を実行
+                new_kl_coef, new_lr, reason = self.trainer.adjust_kl_and_lr(kl_value)
+
+                # トラッカーを更新
+                self.kl_tracker["value"] = new_kl_coef
+                self.lr_tracker["value"] = new_lr
+
+                # wandbにログ（存在する場合）
+                if self.training_logger and hasattr(self.training_logger, 'log_event'):
+                    try:
+                        self.training_logger.log_event(
+                            event="kl_auto_adjust",
+                            update=self.update_count,
+                            kl_value=kl_value,
+                            kl_coef=new_kl_coef,
+                            learning_rate=new_lr,
+                            reason=reason,
+                        )
+                    except Exception:
+                        pass
+
+                # wandbに直接ログ（KL係数の曲線を可視化）
+                try:
+                    import wandb
+                    if wandb.run is not None:
+                        wandb.log({
+                            "train/kl_coef": new_kl_coef,
+                        })
+                except Exception:
+                    pass
+            
+            return control
 
     class KLSpikeDetectionCallback(TrainerCallback):
         """KL爆発を検知してバッチ詳細をダンプ"""
@@ -3139,6 +3425,25 @@ def main():
             approxkl_threshold=0.05,
             objective_kl_threshold=5.0,
         )
+    
+    # KL自動調整コールバック
+    kl_auto_adjust_callback = KLAutoAdjustCallback(
+        trainer=trainer,
+        kl_tracker=current_kl_coef_tracker,
+        lr_tracker=current_lr_tracker,
+        training_logger=training_logger,
+    )
+    trainer.add_callback(kl_auto_adjust_callback)
+    print(f"[KL Auto-Adjust] Callback registered", flush=True)
+    if training_logger is not None:
+        training_logger.log_event(
+            event="kl_auto_adjust_enabled",
+            target_kl=_target_kl,
+            kl_adjust_up=_kl_adjust_up,
+            kl_adjust_down=_kl_adjust_down,
+            lr_adjust_up=_kl_lr_adjust_up,
+            lr_adjust_down=_kl_lr_adjust_down,
+        )
 
     adaptive_kl_callback = None
     if _target_kl > 0.0 and _kl > 0.0:
@@ -3236,6 +3541,111 @@ def main():
                 patience=entropy_patience_value,
                 warmup=entropy_monitor_warmup,
             )
+
+    # 方策崩壊検出コールバック（戦略の多様性監視）
+    class PolicyCollapseDetectionCallback(TrainerCallback):
+        """バッチ内で1つの戦略しか選ばれていない場合に学習を停止"""
+        def __init__(
+            self,
+            batch_collector: BatchSummaryCollector,
+            max_steps: int,
+            warmup_ratio: float,
+            logger: TrainingRunLogger | None = None,
+        ):
+            self.batch_collector = batch_collector
+            self.logger = logger
+            # warmup期間 + 1ステップ後に監視開始
+            self.warmup_steps = int(max_steps * warmup_ratio)
+            self.monitoring_start_step = self.warmup_steps + 1
+            self._triggered = False
+            self._last_checked_batch = -1
+
+            print(f"[PolicyCollapseDetection] Enabled")
+            print(f"  warmup_steps: {self.warmup_steps}")
+            print(f"  monitoring_start_step: {self.monitoring_start_step}")
+
+        def on_step_end(self, args, state, control, **kwargs):
+            """各ステップ終了時にバッチの戦略分布をチェック"""
+            if self._triggered:
+                return control
+
+            step = getattr(state, "global_step", 0) or 0
+
+            # warmup期間中はスキップ
+            if step < self.monitoring_start_step:
+                return control
+
+            # バッチが完了しているかチェック
+            if not self.batch_collector.is_batch_ready():
+                return control
+
+            # 同じバッチを複数回チェックしないようにする
+            current_batch = self.batch_collector.batch_count
+            if current_batch == self._last_checked_batch:
+                return control
+            self._last_checked_batch = current_batch
+
+            # 戦略分布を取得
+            strategy_dist = self.batch_collector.get_strategy_distribution()
+
+            # 戦略の種類数をチェック（output_errorとno_interventionを除外）
+            meaningful_strategies = {
+                k: v for k, v in strategy_dist.items()
+                if k not in ["output_error", "no_intervention"] and v > 0
+            }
+
+            num_strategies = len(meaningful_strategies)
+
+            # ログに記録
+            if self.logger is not None:
+                try:
+                    self.logger.log_event(
+                        event="policy_collapse_check",
+                        step=step,
+                        batch_id=current_batch + 1,
+                        strategy_distribution=strategy_dist,
+                        num_meaningful_strategies=num_strategies,
+                    )
+                except Exception:
+                    pass
+
+            # 1つの戦略しか選ばれていない場合、方策崩壊と判定
+            if num_strategies == 1:
+                control.should_training_stop = True
+                self._triggered = True
+
+                collapsed_strategy = list(meaningful_strategies.keys())[0]
+
+                if self.logger is not None:
+                    self.logger.log_event(
+                        event="policy_collapse_detected",
+                        step=step,
+                        batch_id=current_batch + 1,
+                        collapsed_strategy=collapsed_strategy,
+                        strategy_distribution=strategy_dist,
+                    )
+
+                print(
+                    f"\n[PolicyCollapse] 方策崩壊を検出！学習を停止します。\n"
+                    f"  step: {step}\n"
+                    f"  batch: {current_batch + 1}\n"
+                    f"  collapsed_strategy: {collapsed_strategy}\n"
+                    f"  distribution: {strategy_dist}\n"
+                )
+
+                # wandbにも記録
+                try:
+                    import wandb
+                    if wandb.run is not None:
+                        wandb.log({
+                            "policy_collapse/detected": 1,
+                            "policy_collapse/step": step,
+                            "policy_collapse/strategy": collapsed_strategy,
+                        })
+                except Exception:
+                    pass
+
+            return control
 
     # 決定的評価コールバック
     class DeterministicEvalCallback(TrainerCallback):
@@ -3372,6 +3782,23 @@ def main():
                 traceback.print_exc()
 
             return control
+
+    # 方策崩壊検出を有効化（設定で制御）
+    enable_policy_collapse_detection = getattr(ppo_cfg, "enable_policy_collapse_detection", True)
+
+    if enable_policy_collapse_detection:
+        policy_collapse_callback = PolicyCollapseDetectionCallback(
+            batch_collector=batch_collector,
+            max_steps=ppo_config.max_steps,
+            warmup_ratio=_warmup_ratio,
+            logger=training_logger,
+        )
+        trainer.add_callback(policy_collapse_callback)
+        if training_logger is not None:
+            training_logger.log_event(
+                event="policy_collapse_detection_enabled",
+                monitoring_start_step=policy_collapse_callback.monitoring_start_step,
+            )
 
     # 決定的評価を有効化（設定で制御）
     enable_deterministic_eval = getattr(ppo_cfg, "enable_deterministic_eval", True)

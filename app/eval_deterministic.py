@@ -201,7 +201,10 @@ def _eval_single_scenario(
             )
 
             # 生成
-            inputs = tokenizer(query, return_tensors="pt").to(model.device)
+            # TRLのAutoModelForCausalLMWithValueHeadは.device属性がないため、
+            # パラメータからデバイスを取得
+            model_device = next(model.parameters()).device
+            inputs = tokenizer(query, return_tensors="pt").to(model_device)
             outputs = model.generate(
                 **inputs,
                 max_new_tokens=64,

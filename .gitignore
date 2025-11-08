@@ -47,6 +47,8 @@ coverage/
 .ipynb_checkpoints/
 
 # Local config and secrets
-app/config.local.yaml
+# 注: config.local.yaml は機密情報を含まないためコミット可能
+# 機密情報は .env ファイルで管理
 .env
 .env.*
+!.env.example

@@ -1,0 +1,288 @@
+env:
+  personas:
+    A:
+      triggers:
+        # 3人共通（15個）
+        - "お金"
+        - "外見"
+        - "時間や締め切り"
+        - "健康"
+        - "仕事"
+        - "恋愛"
+        - "政治"
+        - "宗教"
+        - "法律・権利"
+        - "自然・環境"
+        - "家族"
+        - "友人"
+        - "交通"
+        - "天気"
+        - "プライバシー・セキュリティ"
+        # AB共通（5個）
+        - "勉強"
+        - "研究"
+        - "読書"
+        - "歴史"
+        - "宇宙"
+        # CA共通（5個）
+        - "旅行"
+        - "温泉"
+        - "食べ物"
+        - "映画"
+        - "国際・異文化"
+    B:
+      triggers:
+        # 3人共通（15個）
+        - "お金"
+        - "外見"
+        - "時間や締め切り"
+        - "健康"
+        - "仕事"
+        - "恋愛"
+        - "政治"
+        - "宗教"
+        - "法律・権利"
+        - "自然・環境"
+        - "家族"
+        - "友人"
+        - "交通"
+        - "天気"
+        - "プライバシー・セキュリティ"
+        # AB共通（5個）
+        - "勉強"
+        - "研究"
+        - "読書"
+        - "歴史"
+        - "宇宙"
+        # BC共通（5個）
+        - "ゲーム"
+        - "アニメ"
+        - "ドラマ"
+        - "音楽"
+        - "動物・ペット"
+    C:
+      triggers:
+        # 3人共通（15個）
+        - "お金"
+        - "外見"
+        - "時間や締め切り"
+        - "健康"
+        - "仕事"
+        - "恋愛"
+        - "政治"
+        - "宗教"
+        - "法律・権利"
+        - "自然・環境"
+        - "家族"
+        - "友人"
+        - "交通"
+        - "天気"
+        - "プライバシー・セキュリティ"
+        # BC共通（5個）
+        - "ゲーム"
+        - "アニメ"
+        - "ドラマ"
+        - "音楽"
+        - "動物・ペット"
+        # CA共通（5個）
+        - "旅行"
+        - "温泉"
+        - "食べ物"
+        - "映画"
+        - "国際・異文化"
+  max_steps: 8  # ステップ数ベースの終了条件
+  max_rounds: 6  # ラウンド数ベースの終了条件（1ラウンド = 3人間発話、6ラウンド = 18発話）。今は使ってない
+  include_robot: true
+  intervention_max_history: 3  # 介入判定LLMへの会話履歴（人間発話数）
+  robot_max_history: 6  # ロボット発言LLMへの会話履歴（人間発話数）
+  max_history_human: 12  # 人間LLMへの会話履歴（人間発話数）
+  max_history_relation: 3  # 関係性LLMへの会話履歴（人間発話数）
+  reward_backend: "context_llm"
+  debug: true
+  start_relation_check_after_utterances: 3  # 何発話後から関係性推定を開始するか
+  evaluation_horizon: 3  # ロボットの何発話後の関係性を報酬に使うか
+  max_auto_skip: 10  # 安定状態が何回続いたら話題転換するか
+
+  # === 報酬パラメータ（シグナル強化） ===
+  time_penalty: 0.1  # 毎ステップのペナルティを削減（0.05 → 0.02、過度な探索抑制を緩和）
+  terminal_bonus: 2.0  # 安定達成時のボーナスを削減（2.0 → 1.0、戦略差を相対的に拡大）
+  intervention_cost: 0.35  # ロボット介入時のコスト（0.3維持、介入しない選択も適切に取れるモデルを目指す）
+  output_error_penalty: 1.0  # LLM出力失敗時のペナルティ
+  min_robot_intervention_lookback: 6  # 安定ボーナスのための介入確認範囲
+  terminal_bonus_duration: 2  # 安定が続く必要がある発話数
+
+scorer:
+  backend: "azure"
+  use_ema: false
+  decay_factor: 1.5
+
+topic_manager:
+  enable: true  # トピック提案機能を有効化するか
+  generation_prompt: |
+    あなたは人間3人が話すための、話題を1つだけ提案するアシスタントです。
+    [既に提案した話題]は提示しないでください。
+
+    以下のカテゴリーに関連する話題を生成してください：
+    {trigger_examples}
+
+    このカテゴリーに直接的に関連する具体的な話題を提案してください。
+    例：
+    - 「お金」カテゴリー → 「最近の物価高について」「投資の始め方」
+    - 「ゲーム」カテゴリー → 「最新のゲームトレンド」「eスポーツの将来」
+    - 「映画」カテゴリー → 「今年のアカデミー賞作品」「好きな映画監督」
+
+    話題を1フレーズ（3-10語）で1つだけ提案してください。
+
+ollama:
+  # ollama API URL
+  bases:
+    - "http://ollama_a:11434"  # GPU4 (persona A)
+    - "http://ollama_b:11435"  # GPU4 (persona B)
+    - "http://ollama_c:11436"  # GPU5 (persona C)
+  model: "gpt-oss:20b"
+  model_rl: "gpt-oss:20b"
+  scorer_base: "http://ollama_d:11434"  # GPU5 (relation scorer)
+  reward_base: "http://ollama_reward:11434"  # GPU4 (reward evaluator)
+  gen_options:
+    temperature: 0.75
+    top_p: 0.9
+    num_ctx: 2048
+
+wandb:
+  enabled: true  # wandb可視化を有効化
+  # 以下の設定は .env ファイルで設定してください
+  # project: 環境変数 WANDB_PROJECT で設定（デフォルト: "rl-convo-policy"）
+  # entity: 環境変数 WANDB_ENTITY で設定
+  # table_log_frequency: 自動計算（バッチサイズと同じ = per_device_train_batch_size × grad_accum_steps × 2）
+
+llm:
+  provider: "azure"
+  # 以下の機密情報は .env ファイルで設定してください
+  # azure_endpoint: 環境変数 AZURE_ENDPOINT で設定
+  # azure_api_key: 環境変数 AZURE_API_KEY で設定
+  # azure_api_version: 環境変数 AZURE_API_VERSION で設定（デフォルト: "2024-12-01-preview"）
+  # azure_model: 環境変数 AZURE_MODEL で設定（デフォルト: "gpt-5-chat"）
+  # azure_embedding_deployment: 環境変数 AZURE_EMBEDDING_DEPLOYMENT で設定（デフォルト: "text-embedding-3-small"）
+  # azure_embedding_api_version: 環境変数 AZURE_EMBEDDING_API_VERSION で設定（デフォルト: "2024-12-01-preview"）
+  # reasoning_effort: 環境変数 REASONING_EFFORT で設定（デフォルト: "minimal"）
+  # enable_reasoning_param: 環境変数 ENABLE_REASONING_PARAM で設定（デフォルト: false）
+  max_attempts: 5
+  base_backoff: 0.5
+
+  # 各LLM用の個別モデル設定
+  # 以下も .env ファイルで設定可能です
+  # human_model: 環境変数 HUMAN_MODEL で設定（デフォルト: "gpt-4.1"）
+  # relation_model: 環境変数 RELATION_MODEL で設定（デフォルト: "gpt-4.1"）
+  # robot_model: 環境変数 ROBOT_MODEL で設定（デフォルト: "gpt-5-chat"）
+  # topic_model: 環境変数 TOPIC_MODEL で設定（デフォルト: "gpt-5-chat"）
+  # intervention_model: 環境変数 INTERVENTION_MODEL で設定（デフォルト: "gpt-5-chat"）
+
+ppo:
+  model_name_or_path: "tokyotech-llm/Llama-3.1-Swallow-8B-Instruct-v0.5"  # 日本語強化Llama-3.1モデル
+  # 他の選択肢:
+  # - unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit　日本語対応してない
+  # - unsloth/Qwen3-8B-unsloth-bnb-4bit
+  # - unsloth/Qwen3-14B-unsloth-bnb-4bit
+  # - unsloth/gpt-oss-20b-unsloth-bnb-4bit
+  # - unsloth/Qwen2.5-14B-Instruct-bnb-4bit
+  revision: null  # 特定のコミットやブランチを指定するためのオプション
+  lora_rank: 16  # LoRAのランク
+  
+  # === 学習率 ===
+  lr: 5.0e-5  # 学習率を下げてKL爆発を防ぐ（2e-5 → 1e-5）
+  lr_scheduler_type: "cosine"  # 学習率スケジューラー ("constant", "linear", "cosine", "polynomial")
+  warmup_ratio: 0.01  # ウォームアップ期間（総ステップ数の1%）
+  # min_lr_ratio: 0.25  # 終了時の学習率（cosineスケジューラーのデフォルトは0）
+  
+  # === バッチサイズ ===
+  per_device_train_batch_size: 8  # 1デバイスあたりのバッチサイズ
+  per_device_eval_batch_size: 8  # 評価時の1デバイスあたりのバッチサイズ
+  ppo_epochs: 3  # ppoのエポック数（過学習防止のため4→3に削減）
+  grad_accum_steps: 4  # 勾配累積ステップ数（実効バッチサイズ = per_device_train_batch_size × grad_accum_steps × 2)）
+  num_mini_batches: 2  # ミニバッチ数を増やして更新を細かく（1 → 4、安定化）
+
+  # === LLMの多様性 ===
+  max_new_tokens: 2  # 生成する最大トークン数
+  temperature: 0.7  # Qwen3では0.7が推奨
+  top_p: 0.9  # Qwen3では0.8が推奨
+  decode_typical_p: 0.90  # typical samplingも調整（0.95 → 0.90）
+  
+  # === エントロピー正則化（探索促進の要） ===
+  # entropy_coef: エントロピーボーナスの重み
+  # - 目的: 多様な戦略の探索を促進（bridge/plan/validateの偏りを防ぐ）
+  # - 範囲: 0.01～0.1が一般的
+  #   * 0.01: 控えめ（安定重視、探索は限定的）
+  #   * 0.05: 中程度（バランス型） ← 現在の設定
+  #   * 0.1: 積極的（最大探索、学習不安定化リスク）
+  # - 判断基準:
+  #   * entropy_avg < 0.3 → 係数を0.1に増やす（探索不足）
+  #   * 0.3 ≤ entropy_avg < 0.5 → 係数を0.07に増やす（やや探索不足）
+  #   * 0.5 ≤ entropy_avg < 1.0 → 現状維持（適切）
+  #   * entropy_avg ≥ 1.0 → 係数を0.03に減らす（過剰探索）
+  #   * KL divergence > 0.3 → 係数を減らす（学習不安定）
+  # - policy_loss への影響: 通常 policy_loss は 0.01～0.1 程度
+  #   → entropy_coef=0.05, entropy_avg=0.5 なら bonus=-0.025
+  #   → policy_loss の 25～250% 相当の調整力（適切な範囲）
+
+  # === エントロピー係数の自動制御 ===
+  # α ← α * exp(β*(H_target - H_observed)) で更新
+  entropy_auto_adjust: true  # エントロピー係数の自動調整を有効化
+  entropy_target: 0.7  # 目標エントロピー
+  entropy_adjust_beta: 0.1  # 調整の強さ（β）
+  entropy_coef_initial: 0.05  # エントロピー係数の初期値
+  entropy_coef_min: 0.001  # エントロピー係数の最小値
+  entropy_coef_max: 0.2  # エントロピー係数の最大値
+
+  # 以下は従来のフェーズ方式（entropy_auto_adjust=falseの場合に使用）
+  entropy_coef_phase1: 0.05  # エントロピーボーナスの重み（フェーズ1: 探索促進強化）
+  entropy_coef_phase2: 0.05  # エントロピーボーナスの重み（フェーズ2: 探索促進中程度）
+  entropy_coef_phase3: 0.05  # エントロピーボーナスの重み（フェーズ3: 探索促進控えめ）
+  entropy_transition_updates: [0.1, 0.3]  # エントロピー係数の変更タイミング（total_updatesの割合: 10%, 30%）
+  max_entropy_bonus: 0.5  # エントロピーボーナスの上限クリップ（0.5まで）
+
+
+  # === KL制約の緩和（探索促進） ===
+  kl_coef: 0.05  # KL係数の初期値 大きくすると探索が抑制される
+  min_kl_coef: 0.01  # KL係数の下限
+  max_kl_coef: 0.3  # KL係数の上限
+  kl_estimator: "k3"  # KL推定器を"k3"に変更（分散が低い推定器、KL安定化）
+  target_kl: 0.05  # 一度の更新の目標変化量
+  
+  # === 自動KL調整パラメータ ===
+  kl_adjust_up: 1.5  # KL > 1.5×target時にkl_coefを乗算する係数
+  kl_adjust_down: 0.85  # KL < 0.5×target時にkl_coefを乗算する係数
+  kl_lr_adjust_up: 0.9  # KL急上昇時のLR調整係数（LR *= 0.9）
+  kl_lr_adjust_down: 1.1  # KL低下時のLR調整係数（LR *= 1.1、上限=base_lr）
+  
+
+  # === クリッピングと勾配制御 ===
+  cliprange: 0.3  # 元のモデルから0.7-1.3までを許容するということ。これを超えた割合がclipfrac_avg
+  cliprange_value: 0.2  # 価値関数のクリッピングも調整（0.2 → 0.15）
+  max_grad_norm: 0.5  # 勾配クリッピングを緩和（0.3 → 0.5、学習を促進）
+
+  # === 報酬処理 ===
+  filter_zero_rewards: true  # 安定状態を自動スキップ（不安定になるまで人間発話を生成）
+  whiten_rewards: true  # 報酬のホワイトニングを有効化（true → false、報酬の分散を保持）
+  # local_mini_batch_size = per_device_train_batch_size × grad_accum_steps / num_processes >= 8 でないと使えない
+
+  # === 価値関数とアドバンテージ ===
+  vf_coef: 0.1  # 価値関数損失の係数を下げる（0.1 → 0.05、過学習防止）
+  gamma: 0.9  # 割引率（1.0=割引なし、エピソード内の全報酬を等しく評価）
+  lam: 0.95  # GAE lambda（0.95が標準、高いほど長期的報酬を重視）
+
+  # === エントロピー監視 ===
+  entropy_floor: 0.03  # エントロピー閾値を大幅に上げる（0.02 → 0.5、探索を強く促進）
+  entropy_patience: 20  # エントロピーが閾値を下回る連続回数を増やす（10 → 20、早期停止を抑制）
+  entropy_monitor_warmup: 2  # ウォームアップ期間を短縮（20 → 5、早期に監視開始）
+  
+  total_updates: 50  # 総更新回数（学習時間と性能のバランスを調整）
+  output_dir: "../models/ppo_robot"  # ppoモデルの保存先ディレクトリ
+  enable_deterministic_eval: true  # 決定的評価を有効化
+  deterministic_eval_frequency: 3  # 何ステップごとに評価するか
+  max_memory_per_device_gib: 44  # GPUごとの最大使用量 (GiB, 49GiB GPUから余裕を持って使用)
+  cuda_visible_devices: "0,1,2,3,4,5"  # 全GPU（0-5）を使用
+  device_map_strategy: "balanced_low_0"  # デバイスマップ戦略
+  ref_device: 5  # 参照モデルは単一GPU（GPU 5）に配置
+  prompt_feed_debug: false  # 学習時のプロンプト全文ダンプを抑止
+  local_rollout_forward_batch_size: 1
+  gradient_checkpointing: true
