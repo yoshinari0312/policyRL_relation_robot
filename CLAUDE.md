@@ -6,7 +6,7 @@
 
 このプロジェトは、PPO（Proximal Policy Optimization）強化学習を用いた会話ロボット方策の訓練システムです。ロボットは3人の人間による会話に介入し、反実仮想推論と遅延報酬を用いて対人関係の安定化を学習します。
 
-**コアコンセプト**: ペルソナA、B、Cによる3者会話をシミュレートします。ロボット方策（LoRAチューニングされたLLM）は、構造バランス理論とLLMベースの関係性スコアリングで評価される対人関係を安定化させるために、いつどのように介入するかを学習します。
+**コアコンセプト**: ペルソナA、B、Cによる3者会話をシミュレートします。ロボット方策（LoRAチューニングされたLLM）は、構造バランス理論とLLMベースの関係性スコアリングで評価される対人関係を安定化させるために、どのような戦略で介入するか（介入しない選択も含む）を学習します。対象エッジと対象話者はプログラムが自動的に選択します。
 
 ## プロジェクト構成
 
@@ -20,6 +20,8 @@
 
 2. **PPO訓練** (`app/ppo_train.py`)
    - TRL（Transformers Reinforcement Learning）を使用したメイン訓練ループ
+   - LLMは介入戦略のみを学習（1桁の数字出力: 1=validate, 2=bridge, 3=plan, 4=no_intervention）
+   - 対象エッジ・対象話者はプログラムが自動選択（負の中で全体値が小さい関係性エッジを優先）
    - 大規模言語モデルの効率的なファインチューニングのためのLoRA/PEFT
    - カスタムデバイスマッピング戦略によるマルチGPUサポート
    - 方策崩壊を防ぐための適応的KLダイバージェンス係数
@@ -41,11 +43,16 @@
 
 ### 報酬メカニズム
 
-報酬システムは**反実仮想推論**を使用:
+報酬システムは**反実仮想推論**を使用（介入する場合のみ）:
 
-- **実世界（actual）**: ロボットが選択した行動（介入するorしない）後の実際の会話
-- **反実仮想世界（counterfactual）**: ロボットが反対の行動を取った場合の仮想的な会話
-- **報酬の計算式**: `(反実仮想の不安定度 - 実世界の不安定度) - 時間ペナルティ - 介入コスト + 安定ボーナス`
+- **介入する場合（no_intervention以外）**:
+  - **実世界（actual）**: ロボットが介入した後の実際の会話
+  - **反実仮想世界（counterfactual）**: 介入しなかった場合の仮想的な会話
+  - **報酬の計算式**: `(反実仮想の不安定度 - 実世界の不安定度) - 時間ペナルティ - 介入コスト + 安定ボーナス`
+
+- **介入しない場合（no_intervention）**:
+  - 反実仮想シミュレーションは実行しない
+  - **報酬**: `-時間ペナルティ` のみ
 
 主要な報酬パラメータ（`config.local.yaml`で設定）:
 - `evaluation_horizon`: 関係性の安定度を評価する前にシミュレートする人間の発話数
@@ -155,14 +162,16 @@ python app/simulate_gpt5_intervention.py --quiet
 ```
 
 **機能**:
-- GPT5を使った介入判定（いつ・どのように介入するか）
+- GPT5を使った介入戦略の選択（validate/bridge/plan/no_intervention）
+- 対象エッジ・対象話者はプログラムが自動選択
 - セッションごとに新しい話題を自動生成
-- 会話内容、介入判定、関係性スコア、報酬の詳細を出力
+- 会話内容、介入戦略、関係性スコア、報酬の詳細を出力
 - 全セッションの統計（総報酬、平均報酬、介入回数など）を表示
 
 **出力内容**:
 - セッションごとの会話履歴（人間3人 + ロボット）
-- ステップごとの介入判定内容（対象エッジ、戦略、対象話者）
+- ステップごとの介入戦略（validate/bridge/plan/no_intervention）
+- 対象エッジ・対象話者（プログラムが自動選択）
 - 関係性スコア（不安定トライアド数、安定状態）
 - 報酬の内訳（時間ペナルティ、介入コスト、安定ボーナスなど）
 - セッション統計（総報酬、介入回数、平均報酬など）
@@ -307,7 +316,7 @@ PPO訓練は複数のデバイスマッピング戦略をサポート（`ppo.dev
 
 **記録内容**:
 1. **戦略テーブル** (`strategy_table`):
-   - 各介入での戦略選択（validate/bridge/reframe）
+   - 各介入での戦略選択（validate/bridge/plan/no_intervention）
    - 対象エッジ、安定状態の変化、報酬
 
 2. **出力テーブル** (`output_table`):
@@ -315,7 +324,7 @@ PPO訓練は複数のデバイスマッピング戦略をサポート（`ppo.dev
    - 最新100件を保持
 
 3. **戦略分布メトリクス**:
-   - `strategy/validate_ratio`, `strategy/bridge_ratio`, `strategy/reframe_ratio`
+   - `strategy/validate_ratio`, `strategy/bridge_ratio`, `strategy/plan_ratio`, `strategy/no_intervention_ratio`
    - リアルタイムで方策崩壊を検出
 
 **使い方**:
@@ -332,7 +341,8 @@ python app/ppo_train.py
 
 **方策崩壊の検出**:
 - `strategy/validate_ratio > 0.8` → 方策崩壊の兆候
-- `strategy/reframe_ratio = 0` → reframe戦略が消失
+- `strategy/plan_ratio = 0` → plan戦略が消失
+- `strategy/no_intervention_ratio > 0.8` → 介入しない選択に偏る
 
 ### バッチサマリー集計
 
@@ -357,7 +367,8 @@ python app/ppo_train.py
       "strategy": {
         "validate": 8,
         "bridge": 5,
-        "reframe": 3
+        "plan": 2,
+        "no_intervention": 1
       }
     }
   }
@@ -422,7 +433,7 @@ CHANGES_PPO_INTEGRATION.md  # PPO変更のドキュメント
 訓練ログで以下のパターンが見られる場合、方策崩壊が発生している可能性があります：
 
 1. **戦略の偏り**: `strategy/validate_ratio > 0.8`（validate戦略に異常に偏る）
-2. **戦略の消失**: `strategy/reframe_ratio = 0`（reframe戦略が完全に消失）
+2. **戦略の消失**: `strategy/plan_ratio = 0`（plan戦略が完全に消失）または`strategy/no_intervention_ratio > 0.8`（介入しない選択に偏る）
 3. **連続使用**: 同じ戦略が数十回連続で選ばれる
 4. **エントロピー崩壊**: `train/policy/entropy_avg < 0.05`
 5. **KLダイバージェンス暴走**: `train/objective/kl`が0〜12の範囲で激しく変動
