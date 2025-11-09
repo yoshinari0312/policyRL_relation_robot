@@ -199,8 +199,8 @@ def main():
         'jsonl_path',
         type=str,
         nargs='?',
-        default='app/logs/ppo_run-20251108-052544/conversation_summary.jsonl',  #ここを変える
-        help='conversation_summary.jsonlのパス (デフォルト: ppo_run-20251108-052544)'
+        default='app/logs/ppo_run-20251108-161918/conversation_summary.jsonl',  #ここを変える
+        help='conversation_summary.jsonlのパス (デフォルト: ppo_run-20251108-161918)'
     )
     parser.add_argument(
         '--output',

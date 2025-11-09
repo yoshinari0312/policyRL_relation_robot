@@ -228,10 +228,10 @@ ppo:
   # α ← α * exp(β*(H_target - H_observed)) で更新
   entropy_auto_adjust: true  # エントロピー係数の自動調整を有効化
   entropy_target: 0.7  # 目標エントロピー
-  entropy_adjust_beta: 0.1  # 調整の強さ（β）
+  entropy_adjust_beta: 0.3  # 調整の強さ（β）0.1 → 0.3
   entropy_coef_initial: 0.05  # エントロピー係数の初期値
   entropy_coef_min: 0.001  # エントロピー係数の最小値
-  entropy_coef_max: 0.2  # エントロピー係数の最大値
+  entropy_coef_max: 0.3  # エントロピー係数の最大値
 
   # 以下は従来のフェーズ方式（entropy_auto_adjust=falseの場合に使用）
   entropy_coef_phase1: 0.05  # エントロピーボーナスの重み（フェーズ1: 探索促進強化）
