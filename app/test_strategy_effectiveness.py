@@ -273,13 +273,13 @@ def _generate_human_utterance_with_need_and_recovery(
     # 態度回復プロンプト（正解の戦略が選ばれた時のみ適用）
     if is_correct_strategy and any(log.get('speaker') == 'ロボット' for log in conversation_history[-4:]):
         if emotional_need == "recognition":
-            lines.append("【回復の方針】ロボットにあなたの意見や感情が認められたと感じると、心が和み、機嫌が良くなります。他の人に対する態度もだんだん良くなります。\n")
+            lines.append("【回復の方針】ロボットにあなたの意見や感情が認められたため、心が和み、機嫌が良くなります。他の人に対する態度も良くなります。\n")
         elif emotional_need == "mediation":
-            lines.append("【回復の方針】ロボットが仲裁してくれたと感じると、心が和み、機嫌が良くなります。他の人に対する態度もだんだん良くなります。\n")
+            lines.append("【回復の方針】ロボットが仲裁してくれたため、心が和み、機嫌が良くなります。他の人に対する態度も良くなります。\n")
         elif emotional_need == "solution":
-            lines.append("【回復の方針】ロボットが今後の道筋を示してくれたと感じると、心が和み、機嫌が良くなります。他の人に対する態度もだんだん良くなります。\n")
+            lines.append("【回復の方針】ロボットが今後の道筋を示してくれたため、心が和み、機嫌が良くなります。他の人に対する態度も良くなります。\n")
         elif emotional_need == "independence":
-            lines.append("【回復の方針】ロボットが自分のペースを尊重して何もしないでくれたと感じると、心が和み、機嫌が良くなります。他の人に対する態度もだんだん良くなります。\n")
+            lines.append("【回復の方針】ロボットが自分のペースを尊重して何もしないでくれたため、心が和み、機嫌が良くなります。他の人に対する態度も良くなります。\n")
 
         # lines.append("逆に、自分が求めていることと違う対応をされた場合、不機嫌な状態が続きます。\n")
 

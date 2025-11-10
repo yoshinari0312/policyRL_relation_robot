@@ -379,7 +379,6 @@ def select_strategy_from_conversation(
     # 会話履歴をフォーマット
     history_lines = [f"[{log['speaker']}] {log['utterance']}" for log in conversation]
 
-    # 学習環境と同じシステムプロンプト（ppo_train.pyのbuild_robot_messagesと同じ）
     system_content = """
 あなたは、会話が不安定になっているときに、ロボットがどのように介入すれば関係を安定化できるかを判断し、数字1桁を出力するアシスタントです。
 会話は三者（A, B, C）の間で行われており、一時的な対立や不調和が生じています。

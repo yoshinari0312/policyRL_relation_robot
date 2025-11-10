@@ -103,13 +103,17 @@ env:
   evaluation_horizon: 3  # ロボットの何発話後の関係性を報酬に使うか
   max_auto_skip: 10  # 安定状態が何回続いたら話題転換するか
 
-  # === 報酬パラメータ（シグナル強化） ===
-  time_penalty: 0.1  # 毎ステップのペナルティを削減（0.05 → 0.02、過度な探索抑制を緩和）
-  terminal_bonus: 2.0  # 安定達成時のボーナスを削減（2.0 → 1.0、戦略差を相対的に拡大）
-  intervention_cost: 0.35  # ロボット介入時のコスト（0.3維持、介入しない選択も適切に取れるモデルを目指す）
+  # === 報酬パラメータ（新構造：感情ニーズベース） ===
+  stable_bonus: 2.0  # 安定達成時のボーナス（evaluation_horizon + terminal_bonus_duration後も安定が維持された場合）
+  preference_match_bonus: 0.5  # 人間の好み（感情ニーズ）に一致した戦略選択時のボーナス
+  terminal_bonus_duration: 2  # 安定が続く必要がある発話数（evaluation_horizon後にさらにチェック）
+
+  # === 旧報酬パラメータ（互換性のため維持） ===
+  time_penalty: 0.1  # 毎ステップのペナルティ（現在は未使用）
+  terminal_bonus: 2.0  # 安定達成時のボーナス（stable_bonusに置き換え）
+  intervention_cost: 0.35  # ロボット介入時のコスト（現在は未使用）
   output_error_penalty: 1.0  # LLM出力失敗時のペナルティ
-  min_robot_intervention_lookback: 6  # 安定ボーナスのための介入確認範囲
-  terminal_bonus_duration: 2  # 安定が続く必要がある発話数
+  min_robot_intervention_lookback: 6  # 安定ボーナスのための介入確認範囲（現在は未使用）
 
 scorer:
   backend: "azure"
@@ -195,8 +199,8 @@ ppo:
   # min_lr_ratio: 0.25  # 終了時の学習率（cosineスケジューラーのデフォルトは0）
   
   # === バッチサイズ ===
-  per_device_train_batch_size: 8  # 1デバイスあたりのバッチサイズ
-  per_device_eval_batch_size: 8  # 評価時の1デバイスあたりのバッチサイズ
+  per_device_train_batch_size: 4  # 1デバイスあたりのバッチサイズ
+  per_device_eval_batch_size: 4  # 評価時の1デバイスあたりのバッチサイズ
   ppo_epochs: 3  # ppoのエポック数（過学習防止のため4→3に削減）
   grad_accum_steps: 4  # 勾配累積ステップ数（実効バッチサイズ = per_device_train_batch_size × grad_accum_steps × 2)）
   num_mini_batches: 2  # ミニバッチ数を増やして更新を細かく（1 → 4、安定化）
@@ -227,7 +231,7 @@ ppo:
   # === エントロピー係数の自動制御 ===
   # α ← α * exp(β*(H_target - H_observed)) で更新
   entropy_auto_adjust: true  # エントロピー係数の自動調整を有効化
-  entropy_target: 0.7  # 目標エントロピー
+  entropy_target: 0.5  # 目標エントロピー
   entropy_adjust_beta: 0.3  # 調整の強さ（β）0.1 → 0.3
   entropy_coef_initial: 0.05  # エントロピー係数の初期値
   entropy_coef_min: 0.001  # エントロピー係数の最小値

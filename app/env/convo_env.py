@@ -211,7 +211,11 @@ class ConversationEnv:
         self.terminal_bonus = float(terminal_bonus) if terminal_bonus is not None else float(getattr(cfg.env, "terminal_bonus", 0.25))
         self.intervention_cost = float(intervention_cost) if intervention_cost is not None else float(getattr(cfg.env, "intervention_cost", 0.02))
 
-        # 新しいパラメータをYAMLから読み込み
+        # 新しい報酬パラメータ（感情ニーズベース）
+        self.stable_bonus = float(getattr(cfg.env, "stable_bonus", 2.0))
+        self.preference_match_bonus = float(getattr(cfg.env, "preference_match_bonus", 0.5))
+
+        # その他のパラメータをYAMLから読み込み
         self.min_robot_intervention_lookback = int(getattr(cfg.env, "min_robot_intervention_lookback", 6))
         self.terminal_bonus_duration = int(getattr(cfg.env, "terminal_bonus_duration", 2))
 
@@ -320,11 +324,21 @@ class ConversationEnv:
         self.speaker_aggressiveness = {}
         for speaker in self.persona_pool:
             self.speaker_aggressiveness[speaker] = random.random() < 0.5  # True=過激, False=マイルド
-        
+
         if self.debug:
-            aggr_str = ", ".join([f"{s}: {'過激' if is_aggr else 'マイルド'}" 
+            aggr_str = ", ".join([f"{s}: {'過激' if is_aggr else 'マイルド'}"
                                    for s, is_aggr in self.speaker_aggressiveness.items()])
             print(f"[reset] Episode {self.episode} 話者過激度設定: {aggr_str}")
+
+        # 感情ニーズをランダムに割り当て
+        emotional_needs_pool = ["recognition", "mediation", "solution", "independence"]
+        self.persona_emotional_needs = {}
+        for speaker in self.persona_pool:
+            self.persona_emotional_needs[speaker] = random.choice(emotional_needs_pool)
+
+        if self.debug:
+            needs_str = ", ".join([f"{s}: {need}" for s, need in self.persona_emotional_needs.items()])
+            print(f"  💭 感情ニーズ割り当て: {needs_str}")
 
         # トピックを生成
         self.current_topic = self._get_topic_suggestion()
@@ -656,9 +670,6 @@ class ConversationEnv:
                 "human_utterance_before_relation": human_replies_before,  # ログ順序調整用
                 "rel": final_metrics,
                 "reward_breakdown": reward_breakdown,
-                "counterfactual_u_flip": 0,
-                "actual_u_flip": 0,
-                "delta_u_flip": 0,
                 "personas": list(self.persona_pool),
                 # デバッグ用: ステップ開始時の関係性スナップショット（metricsを含む）
                 "rel_before": rel_before_snapshot.get("metrics") if isinstance(rel_before_snapshot, dict) else {},
@@ -817,149 +828,154 @@ class ConversationEnv:
         # 報酬の初期化
         reward = 0.0
         reward_breakdown: Dict[str, float] = {}
-        actual_u_flip = None
-        counterfactual_u_flip = None
-        delta = None
 
-        if not intervened:
-            # Case A: 介入しない場合
-            # タイムペナルティのみ即座に付与
-            if self.debug:
-                print(f"  💸 タイムペナルティを付与: {-self.time_penalty:.4f}")
-            reward = -self.time_penalty
-            reward_breakdown["time_penalty"] = -self.time_penalty
+        # planから戦略情報を取得
+        edge_to_change = plan.get("edge_to_change", "AB") if plan else "AB"
+        target_speaker = plan.get("target_speaker", "A") if plan else "A"
+        strategy = plan.get("strategy", "plan") if plan else "plan"
 
-            self.steps_since_last_intervention += 1
-
-        else:
-            # Case B: 介入する場合
-            # ロボット発話を追加
+        # ロボット発話を追加（介入する場合のみ）
+        if intervened:
             self.logs.append(robot_entry)
 
-            if self.debug:
-                print(f"  🔄 並行シミュレーション開始")
-                print(f"    - 実世界: evaluation_horizon={self.evaluation_horizon}回の人間発話")
-                print(f"    - 反実仮想: 介入しなかった場合をシミュレーション")
+        # evaluation_horizon回の人間発話を生成
+        if self.debug:
+            print(f"  🔄 {self.evaluation_horizon}回の人間発話を生成")
 
-            # 並行処理: 実世界と反実仮想シミュレーションを同時実行
-            async def run_parallel_simulation():
-                # スナップショット（ロボット発話前）
-                snapshot = [dict(entry) for entry in snapshot_logs]
+        # 感情ニーズと正解戦略フラグを準備
+        emotional_needs = self.persona_emotional_needs.copy()
+        is_correct_strategy_flags = {}
 
-                # 実世界: ロボット発話後、evaluation_horizon回の人間発話
-                # （self.logsを直接使用せず、新しいスコアラーで管理）
-                actual_scorer = RelationScorer(**self._scorer_kwargs)
-                actual_logs_task = self._bootstrap_humans_async(
-                    self.logs.copy(),
-                    self.evaluation_horizon,
-                    actual_scorer
-                )
-
-                # 反実仮想: 介入しなかった場合（スナップショットから）
-                counterfactual_task = self._simulate_forward_async(
-                    snapshot,
-                    self.evaluation_horizon,
-                    plan=None
-                )
-
-                # 両方の完了を待つ
-                actual_logs, (cf_u_flip, _) = await asyncio.gather(
-                    actual_logs_task,
-                    counterfactual_task
-                )
-
-                return actual_logs, cf_u_flip
-
-            # asyncio.run()で同期的に実行
-            actual_logs, counterfactual_u_flip = asyncio.run(run_parallel_simulation())
-
-            if self.debug:
-                print(f"  ✅ 並行シミュレーション完了")
-                print(f"    反実仮想不安定度: {counterfactual_u_flip:.4f}")
-
-            # 実世界のログを環境に反映
-            self.logs = actual_logs
-
-            if self.debug:
-                print(f"  📝 実世界の会話ログを更新（{len(self.logs)}発話）")
-
-            # evaluation_horizon後の関係性を評価
-            participants_after = self._participants(self.logs)
-            human_utterance_count_after = sum(1 for log in self.logs if log.get('speaker') != 'ロボット')
-
-            if human_utterance_count_after >= self.start_relation_check_after_utterances:
-                filtered_logs_after = filter_logs_by_human_count(self.logs, self.max_history_relation, exclude_robot=True)
-                rel_after, _ = self._relation_state(filtered_logs_after, update_state=True)
-                actual_u_flip = self._compute_u_flip_from_scores(rel_after)
+        # 各話者について正解戦略かどうかをチェック
+        for speaker in self.persona_pool:
+            preferred = self._get_human_preferred_strategy(speaker)
+            # 対象話者の場合は実際の戦略と比較、それ以外はFalse
+            if speaker == target_speaker:
+                is_correct_strategy_flags[speaker] = (strategy == preferred)
             else:
-                rel_after = {}
-                actual_u_flip = 1.0
+                is_correct_strategy_flags[speaker] = False
 
-            metrics_after, _ = self._metrics_state(rel_after, participants_after)
-            is_stable_after = metrics_after.get("unstable_triads", 0) == 0
+        self._bootstrap_humans(
+            self.evaluation_horizon,
+            emotional_needs=emotional_needs,
+            is_correct_strategy_flags=is_correct_strategy_flags
+        )
 
+        # evaluation_horizon後の関係性を評価
+        participants_after = self._participants(self.logs)
+        human_utterance_count_after = sum(1 for log in self.logs if log.get('speaker') != 'ロボット')
+
+        if human_utterance_count_after >= self.start_relation_check_after_utterances:
+            filtered_logs_after = filter_logs_by_human_count(self.logs, self.max_history_relation, exclude_robot=True)
+            rel_after, _ = self._relation_state(filtered_logs_after, update_state=True)
+        else:
+            rel_after = {}
+
+        metrics_after, _ = self._metrics_state(rel_after, participants_after)
+        is_stable_after = metrics_after.get("unstable_triads", 0) == 0
+
+        # 対象エッジのスコアを取得（stable_bonus判定に使用）
+        def get_edge_score(edge_str: str, scores_dict: Dict[Tuple[str, str], float]) -> float:
+            """エッジ文字列（"AB"など）からスコアを取得"""
+            if len(edge_str) >= 2:
+                # ("A", "B") または ("B", "A") を試す
+                edge_tuple1 = (edge_str[0], edge_str[1])
+                edge_tuple2 = (edge_str[1], edge_str[0])
+                return scores_dict.get(edge_tuple1, scores_dict.get(edge_tuple2, 0.0))
+            return 0.0
+
+        target_edge_score_after = get_edge_score(edge_to_change, rel_after)
+        target_edge_positive_after = target_edge_score_after > 0
+
+        if self.debug:
+            print(f"  📊 evaluation_horizon後の関係性:")
+            print(f"    安定状態: {is_stable_after}")
+            print(f"    対象エッジ（{edge_to_change}）スコア: {target_edge_score_after:.4f}")
+            print(f"    対象エッジが正: {target_edge_positive_after}")
+
+        # 報酬計算: stable_bonus + preference_match_bonus
+        rel_after_bonus = None  # terminal_bonus_duration後の関係性を保存する変数
+
+        # stable_bonus付与条件: 対象エッジが正 AND 全体が安定
+        if is_stable_after and target_edge_positive_after:
             if self.debug:
-                print(f"  📊 evaluation_horizon後の関係性:")
-                print(f"    実際の不安定度: {actual_u_flip:.4f}")
-                print(f"    安定状態: {is_stable_after}")
+                print(f"  🎯 安定達成 & 対象エッジ正 → terminal_bonusチェック開始")
+                print(f"    追加で{self.terminal_bonus_duration}人間発話分の安定性を確認")
+        elif self.debug:
+            if not is_stable_after:
+                print(f"  ⚠️  全体が不安定 → stable_bonusなし")
+            elif not target_edge_positive_after:
+                print(f"  ⚠️  対象エッジ（{edge_to_change}）が正でない（{target_edge_score_after:.4f}） → stable_bonusなし")
 
-            # 報酬計算
-            delta = counterfactual_u_flip - actual_u_flip
-            reward = delta - self.intervention_cost - self.time_penalty
-            reward_breakdown["delta_u_flip"] = delta
-            reward_breakdown["counterfactual_u_flip"] = counterfactual_u_flip
-            reward_breakdown["actual_u_flip"] = actual_u_flip
-            reward_breakdown["intervention_cost"] = -self.intervention_cost
-            reward_breakdown["time_penalty"] = -self.time_penalty
+        if is_stable_after and target_edge_positive_after:
 
-            if self.debug:
-                print(f"  💰 報酬計算:")
-                print(f"    関係性改善効果: {delta:.4f}")
-                print(f"    介入コスト: {-self.intervention_cost:.4f}")
-                print(f"    タイムペナルティ: {-self.time_penalty:.4f}")
-                print(f"    小計: {reward:.4f}")
+            # terminal_bonus_duration人間発話を生成（実際には1ラウンド = 3人間発話が最小単位）
+            # 感情ニーズと正解戦略フラグを引き継ぐ
+            self._bootstrap_humans(
+                self.terminal_bonus_duration,
+                emotional_needs=emotional_needs,
+                is_correct_strategy_flags=is_correct_strategy_flags
+            )
 
-            # 安定になった場合、terminal_bonus_durationチェック
-            rel_after_bonus = None  # terminal_bonus_duration後の関係性を保存する変数
-            if is_stable_after:
-                if self.debug:
-                    print(f"  🎯 安定達成 → terminal_bonusチェック開始")
-                    print(f"    追加で{self.terminal_bonus_duration}人間発話分の安定性を確認")
+            # 最後の関係性を再評価
+            participants_check = self._participants(self.logs)
+            human_count_check = sum(1 for log in self.logs if log.get('speaker') != 'ロボット')
 
-                # terminal_bonus_duration人間発話を生成（実際には1ラウンド = 3人間発話が最小単位）
-                self._bootstrap_humans(self.terminal_bonus_duration)
+            stability_maintained = True
+            target_edge_positive_check = False
+            if human_count_check >= self.start_relation_check_after_utterances:
+                filtered_check = filter_logs_by_human_count(self.logs, self.max_history_relation, exclude_robot=True)
+                rel_check, _ = self._relation_state(filtered_check, update_state=True)
+                metrics_check, _ = self._metrics_state(rel_check, participants_check)
 
-                # 最後の関係性を再評価
-                participants_check = self._participants(self.logs)
-                human_count_check = sum(1 for log in self.logs if log.get('speaker') != 'ロボット')
+                # 対象エッジのスコアをチェック
+                target_edge_score_check = get_edge_score(edge_to_change, rel_check)
+                target_edge_positive_check = target_edge_score_check > 0
 
-                stability_maintained = True
-                if human_count_check >= self.start_relation_check_after_utterances:
-                    filtered_check = filter_logs_by_human_count(self.logs, self.max_history_relation, exclude_robot=True)
-                    rel_check, _ = self._relation_state(filtered_check, update_state=True)
-                    metrics_check, _ = self._metrics_state(rel_check, participants_check)
-
-                    if metrics_check.get("unstable_triads", 0) > 0:
-                        # 不安定に戻った
-                        stability_maintained = False
-                        if self.debug:
-                            print(f"    ❌ 不安定に戻った")
-                    else:
-                        if self.debug:
-                            print(f"    ✅ 安定維持")
-
-                # terminal_bonus_duration人間発話後も安定が続いた場合
-                if stability_maintained:
+                if metrics_check.get("unstable_triads", 0) > 0:
+                    # 不安定に戻った
+                    stability_maintained = False
                     if self.debug:
-                        print(f"  🎁 安定が持続 → terminal_bonus付与: +{self.terminal_bonus:.4f}")
-                    reward += self.terminal_bonus
-                    reward_breakdown["terminal_bonus"] = self.terminal_bonus
-                    # terminal_bonus_duration後の関係性を保存（後でinfoに追加）
-                    rel_after_bonus = metrics_check
-                elif self.debug:
-                    print(f"  ⚠️  安定が持続せず → terminal_bonusなし")
+                        print(f"    ❌ 不安定に戻った")
+                elif not target_edge_positive_check:
+                    # 対象エッジが負または0になった
+                    stability_maintained = False
+                    if self.debug:
+                        print(f"    ❌ 対象エッジ（{edge_to_change}）が負または0に: {target_edge_score_check:.4f}")
+                else:
+                    if self.debug:
+                        print(f"    ✅ 安定維持 & 対象エッジ正（{target_edge_score_check:.4f}）")
 
+            # terminal_bonus_duration人間発話後も安定が続き、対象エッジも正の場合
+            if stability_maintained and target_edge_positive_check:
+                if self.debug:
+                    print(f"  🎁 安定が持続 & 対象エッジ正 → stable_bonus付与: +{self.stable_bonus:.4f}")
+                reward += self.stable_bonus
+                reward_breakdown["stable_bonus"] = self.stable_bonus
+                # terminal_bonus_duration後の関係性を保存（後でinfoに追加）
+                rel_after_bonus = metrics_check
+            elif self.debug:
+                if not stability_maintained:
+                    print(f"  ⚠️  安定が持続せず → stable_bonusなし")
+                elif not target_edge_positive_check:
+                    print(f"  ⚠️  対象エッジが正でない → stable_bonusなし")
+
+        # 正解戦略の場合、preference_match_bonusを付与
+        preferred_strategy = self._get_human_preferred_strategy(target_speaker)
+        is_correct_strategy = (strategy == preferred_strategy)
+        if is_correct_strategy:
+            reward += self.preference_match_bonus
+            reward_breakdown["preference_match_bonus"] = self.preference_match_bonus
+            if self.debug:
+                print(f"  ✅ 正解戦略（{strategy}） → preference_match_bonus付与: +{self.preference_match_bonus:.4f}")
+
+        if self.debug:
+            print(f"  💰 最終報酬: {reward:.4f}")
+
+        if intervened:
             self.steps_since_last_intervention = 0
+        else:
+            self.steps_since_last_intervention += 1
 
         # ステップカウンタを更新
         self._episode_step += 1
@@ -1003,13 +1019,20 @@ class ConversationEnv:
             "human_utterance_before_relation": human_replies_before,  # ログ順序調整用
             "rel": final_metrics,
             "reward_breakdown": reward_breakdown,
-            "counterfactual_u_flip": counterfactual_u_flip,
-            "actual_u_flip": actual_u_flip,
-            "delta_u_flip": delta,
             "personas": list(self.persona_pool),
             # デバッグ用: ステップ開始時の関係性スナップショット（metricsを含む）
             "rel_before": rel_before_snapshot.get("metrics") if isinstance(rel_before_snapshot, dict) else {},
             "next_observation": next_observation,
+            # 感情ニーズと戦略情報
+            "emotional_needs": dict(self.persona_emotional_needs),
+            "target_speaker": target_speaker,
+            "chosen_strategy": strategy,
+            "preferred_strategy": preferred_strategy,
+            "preference_match": is_correct_strategy,
+            # 対象エッジ情報（stable_bonus判定用）
+            "edge_to_change": edge_to_change,
+            "target_edge_score_after": target_edge_score_after,
+            "target_edge_positive_after": target_edge_positive_after,
         }
 
         # ステップ開始時の関係性を追加（ログ用）
@@ -1338,6 +1361,21 @@ class ConversationEnv:
 
         strategy = plan.get("strategy")
 
+        # no_interventionの場合は「見守り」発話
+        if strategy == "no_intervention":
+            import random
+            utterances = [
+                "（静かに聞いています）",
+                "（うなずいて見守っています）",
+                "（話を聞いています）",
+                "（黙って耳を傾けています）"
+            ]
+            utterance = random.choice(utterances)
+            return {
+                "speaker": "ロボット",
+                "utterance": utterance
+            }
+
         # robot_max_history個の人間発話 + その間のロボット発話を取得（ロボット発話生成用）
         filtered_logs = filter_logs_by_human_count(self.logs, self.robot_max_history)
         history_lines = [
@@ -1417,13 +1455,27 @@ class ConversationEnv:
         }
         return templates.get(strategy, templates["plan"])
 
-    def _bootstrap_humans(self, target_turns: int) -> None:
+    def _bootstrap_humans(
+        self,
+        target_turns: int,
+        emotional_needs: Optional[Dict[str, str]] = None,
+        is_correct_strategy_flags: Optional[Dict[str, bool]] = None
+    ) -> None:
         # 人間参加者の発話を追加して会話を進める
         turns_added = 0
         safety_limit = max(1, self.max_steps * max(1, len(self.persona_pool)) * 3)
         while turns_added < target_turns and turns_added < safety_limit:
             # 1人間発話ずつ生成
-            replies = human_reply(self.logs, self.persona_pool, topic=self.current_topic, topic_trigger=self.current_topic_trigger, num_speakers=1, speaker_aggressiveness=self.speaker_aggressiveness)
+            replies = human_reply(
+                self.logs,
+                self.persona_pool,
+                topic=self.current_topic,
+                topic_trigger=self.current_topic_trigger,
+                num_speakers=1,
+                speaker_aggressiveness=self.speaker_aggressiveness,
+                emotional_needs=emotional_needs,
+                is_correct_strategy_flags=is_correct_strategy_flags
+            )
             if not replies:
                 break
             self.logs.extend(replies)
@@ -1556,121 +1608,16 @@ class ConversationEnv:
             best_total = 0.0
         return best_total, best_sign, best_distances
 
-    def _compute_u_flip_from_scores(self, scores: Dict[Tuple[str, str], float]) -> float:
-        weights = self._edge_weights_from_scores(scores)
-        u_flip, _, _ = self._compute_u_flip(weights)
-        return u_flip
-
-    def _simulate_forward(
-        self,
-        snapshot: List[Dict[str, Any]],
-        human_turns: int,
-        plan: Optional[Dict[str, Any]],
-    ) -> float:
-        """
-        将来の人間発話をシミュレートして不安定度 u_flip を計算する
-        
-        遅延報酬の設計:
-        - ロボットが介入する場合: ロボット発話 + human_turns回の人間発話後の関係性
-        - ロボットが介入しない場合: human_turns回の人間発話後の関係性
-        
-        Args:
-            snapshot: 現在の会話ログのスナップショット
-            human_turns: シミュレートする人間発話の回数（evaluation_horizon）
-            plan: ロボットの介入プラン（Noneの場合は介入なし）
-        
-        Returns:
-            u_flip: シミュレート後の不安定度
-        """
-        logs = copy.deepcopy(snapshot)
-        scorer = RelationScorer(**self._scorer_kwargs)
-
-        # ロボットが介入する場合、ロボット発話を追加
-        if plan and plan.get("intervene_now"):
-            logs.append(self._render_intervention(plan, simulate=True))
-
-        # human_turns回の人間発話を追加
-        turns_added = 0
-        safety_limit = max(1, self.max_steps * max(1, len(self.persona_pool)))
-        while turns_added < human_turns and turns_added < safety_limit:
-            # 1人間発話ずつ生成
-            replies = human_reply(logs, self.persona_pool, topic=self.current_topic, topic_trigger=self.current_topic_trigger, num_speakers=1, speaker_aggressiveness=self.speaker_aggressiveness)
-            if not replies:
-                break
-            logs.extend(replies)
-            participants = self._participants(logs)
-            if participants:
-                # 関係性推定を3発話後から行う
-                human_utterance_count = sum(1 for log in logs if log.get('speaker') != 'ロボット')
-                if human_utterance_count >= self.start_relation_check_after_utterances:
-                    # 関係性LLMにはロボット発話を除外して渡す
-                    filtered_logs = filter_logs_by_human_count(logs, self.max_history_relation, exclude_robot=True)
-                    scorer.get_scores(filtered_logs, participants, return_trace=False, update_state=True)
-            turns_added += len([r for r in replies if r.get("speaker") != "ロボット"])
-
-        # human_turns回後の関係性を計算
-        participants = self._participants(logs)
-        human_utterance_count = sum(1 for log in logs if log.get('speaker') != 'ロボット')
-        if human_utterance_count >= self.start_relation_check_after_utterances and participants:
-            # 関係性LLMにはロボット発話を除外して渡す
-            filtered_logs = filter_logs_by_human_count(logs, self.max_history_relation, exclude_robot=True)
-            scores = scorer.get_scores(filtered_logs, participants, return_trace=False, update_state=False)
-            weights = self._edge_weights_from_scores(scores)
-            u_flip, _, _ = self._compute_u_flip(weights)
-        else:
-            # 3発話未満の場合は不安定度を最大値（1.0）に設定
-            u_flip = 1.0
-
-        return u_flip
-
-    async def _simulate_forward_async(
-        self,
-        snapshot: List[Dict[str, Any]],
-        human_turns: int,
-        plan: Optional[Dict[str, Any]],
-    ) -> Tuple[float, List[Dict[str, Any]]]:
-        """
-        将来の人間発話を非同期でシミュレートして不安定度 u_flip を計算する
-
-        Args:
-            snapshot: 現在の会話ログのスナップショット
-            human_turns: シミュレートする人間発話の回数（evaluation_horizon）
-            plan: ロボットの介入プラン（Noneの場合は介入なし）
-
-        Returns:
-            (u_flip, logs): シミュレート後の不安定度と更新された会話ログ
-        """
-        logs = copy.deepcopy(snapshot)
-        scorer = RelationScorer(**self._scorer_kwargs)
-
-        # ロボットが介入する場合、ロボット発話を追加
-        if plan and plan.get("intervene_now"):
-            logs.append(self._render_intervention(plan, simulate=True))
-
-        # human_turns回の人間発話を非同期で追加
-        logs = await self._bootstrap_humans_async(logs, human_turns, scorer)
-
-        # human_turns回後の関係性を計算
-        participants = self._participants(logs)
-        human_utterance_count = sum(1 for log in logs if log.get('speaker') != 'ロボット')
-        if human_utterance_count >= self.start_relation_check_after_utterances and participants:
-            # 関係性LLMにはロボット発話を除外して渡す
-            filtered_logs = filter_logs_by_human_count(logs, self.max_history_relation, exclude_robot=True)
-            # get_scoresを非同期で実行
-            scores = await asyncio.to_thread(
-                scorer.get_scores,
-                filtered_logs,
-                participants,
-                return_trace=False,
-                update_state=False
-            )
-            weights = self._edge_weights_from_scores(scores)
-            u_flip, _, _ = self._compute_u_flip(weights)
-        else:
-            # 3発話未満の場合は不安定度を最大値（1.0）に設定
-            u_flip = 1.0
-
-        return u_flip, logs
+    def _get_human_preferred_strategy(self, target_speaker: str) -> str:
+        """対象話者の感情ニーズから好まれる戦略を返す"""
+        need = self.persona_emotional_needs.get(target_speaker, "recognition")
+        need_to_strategy = {
+            "recognition": "validate",
+            "mediation": "bridge",
+            "solution": "plan",
+            "independence": "no_intervention"
+        }
+        return need_to_strategy[need]
 
     def _is_balanced(self) -> bool:
         # 現在の会話ログに基づき、関係が安定状態かどうかを判定

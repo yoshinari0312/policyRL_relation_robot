@@ -81,7 +81,7 @@ def _post_ollama(prompt: str, base: str) -> str:
     return result
 
 
-def build_human_prompt(speaker: str, logs: List[Dict], topic: str = None, topic_trigger: str = None, is_aggressive: bool = None) -> str:
+def build_human_prompt(speaker: str, logs: List[Dict], topic: str = None, topic_trigger: str = None, is_aggressive: bool = None, emotional_need: Optional[str] = None, is_correct_strategy: bool = False) -> str:
     """Construct a neutral conversation prompt for the given speaker.
 
     Args:
@@ -90,6 +90,8 @@ def build_human_prompt(speaker: str, logs: List[Dict], topic: str = None, topic_
         topic: 会話のトピック
         topic_trigger: トピックの元になった地雷（この地雷だけを使用）
         is_aggressive: 話者の過激度（True=過激, False=マイルド, None=ランダム）
+        emotional_need: 感情ニーズ（recognition/mediation/solution/independence）
+        is_correct_strategy: 正解戦略が選ばれたか（回復プロンプト適用フラグ）
     """
     # max_history_human個の人間発話 + その間のロボット発話を取得
     cfg = get_config()
@@ -249,9 +251,29 @@ def build_human_prompt(speaker: str, logs: List[Dict], topic: str = None, topic_
             common_msg = format_common_triggers_message([topic_trigger], other_speakers)
             lines.append(f"{common_msg}\n")
 
-    # 地雷がある場合のみ回復の方針を追加
-    if triggers:
-        lines.append("回復の方針：一度不機嫌（対立状態）になって戻るためには、ロボットを含む他者が自分に対してかなり寄り添ってくれた時や、自分への発言に納得できた時などに限ります。実在の人もそうですが、簡単に不機嫌でなくなることはありません。\n")
+    # 感情ニーズの内部説明（表には出さない）
+    if emotional_need:
+        need_descriptions = {
+            "recognition": "あなたは内心、自分の意見や感情を認めてほしいと思っています。",
+            "mediation": "あなたは内心、仲裁を求めており、誰かに仲を取り持ってほしいと思っています。",
+            "solution": "あなたは内心、今後の道筋を示してほしいと思っています。",
+            "independence": "あなたは内心、他人に介入されず、放っておいてほしいと思っています。"
+        }
+        lines.append(f"\n{need_descriptions.get(emotional_need, '')}\n")
+
+    # 態度回復プロンプト（正解戦略の時のみ適用）
+    if is_correct_strategy and any(log.get('speaker') == 'ロボット' for log in filtered_logs[-5:]):
+        lines.append("\n【回復の方針】\n")
+        lines.append("あなたは、相手の発言や態度によって気持ちが変化します。\n")
+
+        if emotional_need == "recognition":
+            lines.append("ロボットにあなたの意見や感情が認められたと感じると、心が和み、機嫌が良くなります。他の人に対する態度もだんだん良くなります。\n")
+        elif emotional_need == "mediation":
+            lines.append("ロボットが仲裁してくれたと感じると、心が和み、機嫌が良くなります。他の人に対する態度もだんだん良くなります。\n")
+        elif emotional_need == "solution":
+            lines.append("ロボットが今後の道筋を示してくれたと感じると、心が和み、機嫌が良くなります。他の人に対する態度もだんだん良くなります。\n")
+        elif emotional_need == "independence":
+            lines.append("ロボットが自分のペースを尊重して何もしないでくれたと感じると、心が和み、機嫌が良くなります。他の人に対する態度もだんだん良くなります。\n")
 
     lines.extend([
         f"出力：{speaker} の次発話のみ（1–2文、自然な日本語）\n",
@@ -263,7 +285,7 @@ def build_human_prompt(speaker: str, logs: List[Dict], topic: str = None, topic_
     ])
     return "\n".join(lines)
 
-def human_reply(logs: List[Dict], personas: List[str], topic: str = None, topic_trigger: str = None, num_speakers: Optional[int] = None, speaker_aggressiveness: Optional[Dict[str, bool]] = None) -> List[Dict]:
+def human_reply(logs: List[Dict], personas: List[str], topic: str = None, topic_trigger: str = None, num_speakers: Optional[int] = None, speaker_aggressiveness: Optional[Dict[str, bool]] = None, emotional_needs: Optional[Dict[str, str]] = None, is_correct_strategy_flags: Optional[Dict[str, bool]] = None) -> List[Dict]:
     """会話参加者それぞれの応答を生成する。
 
     Args:
@@ -273,6 +295,8 @@ def human_reply(logs: List[Dict], personas: List[str], topic: str = None, topic_
         topic_trigger: トピックの元になった地雷（この地雷だけを使用）
         num_speakers: 生成する発話数（Noneの場合は全員分、1の場合は1人間発話のみ）
         speaker_aggressiveness: 各話者の過激度 {speaker: is_aggressive}（True=過激, False=マイルド）
+        emotional_needs: 各話者の感情ニーズ {speaker: emotional_need}
+        is_correct_strategy_flags: 各話者が正解戦略を受けたかどうか {speaker: is_correct}
     """
 
     replies = []
@@ -324,12 +348,16 @@ def human_reply(logs: List[Dict], personas: List[str], topic: str = None, topic_
         # 話者の過激度を取得（指定されていない場合はNone→ランダム）
         is_aggressive = speaker_aggressiveness.get(speaker) if speaker_aggressiveness else None
 
+        # 話者の感情ニーズと正解戦略フラグを取得
+        emotional_need = emotional_needs.get(speaker) if emotional_needs else None
+        is_correct_strategy = is_correct_strategy_flags.get(speaker, False) if is_correct_strategy_flags else False
+
         if provider == "azure":
             client, deployment = get_azure_chat_completion_client(getattr(_CFG, "llm", None), model_type="human")
             max_attempts = getattr(_CFG.llm, "max_attempts", 5) or 5
             base_backoff = getattr(_CFG.llm, "base_backoff", 0.5) or 0.5
             if client and deployment:
-                persona_prompt = build_human_prompt(speaker, prompt_logs, topic=topic, topic_trigger=topic_trigger, is_aggressive=is_aggressive)
+                persona_prompt = build_human_prompt(speaker, prompt_logs, topic=topic, topic_trigger=topic_trigger, is_aggressive=is_aggressive, emotional_need=emotional_need, is_correct_strategy=is_correct_strategy)
                 messages = [
                     {
                         "role": "system",
@@ -369,7 +397,7 @@ def human_reply(logs: List[Dict], personas: List[str], topic: str = None, topic_
             base = _BASES[idx % len(_BASES)]
             for attempt in range(1, max_attempts + 1):
                 try:
-                    candidate = _post_ollama(build_human_prompt(speaker, prompt_logs, topic=topic, topic_trigger=topic_trigger, is_aggressive=is_aggressive), base=base)
+                    candidate = _post_ollama(build_human_prompt(speaker, prompt_logs, topic=topic, topic_trigger=topic_trigger, is_aggressive=is_aggressive, emotional_need=emotional_need, is_correct_strategy=is_correct_strategy), base=base)
                 except Exception as e:
                     if _CFG.env.debug:
                         print(f"[human_reply] Ollama call error for {speaker}: {e}")

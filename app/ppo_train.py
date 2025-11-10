@@ -848,6 +848,11 @@ class TrainingRunLogger:
                 reward_info = payload.get("reward", {})
                 total_reward = reward_info.get("total", 0.0)
 
+                # 感情ニーズと戦略マッチング情報を取得
+                preferred_strategy = payload.get("preferred_strategy", "")
+                preference_match = payload.get("preference_match", False)
+                target_edge_positive = payload.get("target_edge_positive_after", False)
+
                 # 戦略テーブルに追加（target_speakerとutteranceを追加）
                 self._strategy_table_data.append([
                     self._interaction_count,  # step
@@ -861,6 +866,9 @@ class TrainingRunLogger:
                     is_stable_after,  # stable_after
                     total_reward,  # reward
                     decision_type,  # intervention_type (intervention/no_intervention)
+                    preferred_strategy,  # preferred_strategy
+                    preference_match,  # preference_match
+                    target_edge_positive,  # target_edge_positive (対象エッジが正かどうか)
                 ])
 
                 # Rolling window介入率の更新
@@ -962,7 +970,8 @@ class TrainingRunLogger:
             if self._strategy_table_data:
                 strategy_table = wandb.Table(
                     columns=["step", "episode", "turn", "strategy", "target_edge", "target_speaker",
-                            "utterance", "stable_before", "stable_after", "reward", "decision_type"],
+                            "utterance", "stable_before", "stable_after", "reward", "decision_type",
+                            "preferred_strategy", "preference_match", "target_edge_positive"],
                     data=self._strategy_table_data
                 )
                 try:
@@ -977,6 +986,8 @@ class TrainingRunLogger:
                 from collections import Counter
                 strategy_counts = Counter([row[3] for row in self._strategy_table_data])
                 decision_counts = Counter([row[10] for row in self._strategy_table_data])  # decision_type列
+                preference_match_counts = Counter([row[12] for row in self._strategy_table_data])  # preference_match列
+                target_edge_positive_counts = Counter([row[13] for row in self._strategy_table_data])  # target_edge_positive列
                 total = sum(strategy_counts.values())
 
                 if total > 0:
@@ -984,6 +995,14 @@ class TrainingRunLogger:
                     intervention_count = decision_counts.get("intervention", 0)
                     no_intervention_count = decision_counts.get("no_intervention", 0)
                     intervention_rate = intervention_count / total if total > 0 else 0.0
+
+                    # 戦略マッチング率の計算
+                    preference_match_count = preference_match_counts.get(True, 0)
+                    preference_match_rate = preference_match_count / total if total > 0 else 0.0
+
+                    # 対象エッジが正である割合の計算
+                    target_edge_positive_count = target_edge_positive_counts.get(True, 0)
+                    target_edge_positive_rate = target_edge_positive_count / total if total > 0 else 0.0
 
                     try:
                         wandb.log({
@@ -1006,6 +1025,16 @@ class TrainingRunLogger:
                             "intervention/count": intervention_count,
                             "intervention/no_intervention_count": no_intervention_count,
                             "intervention/total_decisions": total,
+
+                            # 戦略マッチングメトリクス
+                            "preference/match_rate": preference_match_rate,
+                            "preference/match_count": preference_match_count,
+                            "preference/mismatch_count": total - preference_match_count,
+
+                            # 対象エッジメトリクス（stable_bonus付与の前提条件）
+                            "target_edge/positive_rate": target_edge_positive_rate,
+                            "target_edge/positive_count": target_edge_positive_count,
+                            "target_edge/negative_or_zero_count": total - target_edge_positive_count,
 
                             "step": self._interaction_count,
                         })
@@ -1069,25 +1098,41 @@ def build_robot_messages(
 あなたは、会話が不安定になっているときに、ロボットがどのように介入すれば関係を安定化できるかを判断し、数字1桁を出力するアシスタントです。
 会話は三者（A, B, C）の間で行われており、一時的な対立や不調和が生じています。
 
-入力として、
-- 三者の会話文脈
-- 各ペア（AB, BC, CA）の関係スコア（-1〜1）
-- 今回の介入対象者（ターゲット）
-- その対象関係ペア（エッジ）
-が与えられます。
+【目的】
+ターゲットとなる人物を中心に、その人物が含まれる関係（エッジ）を安定（+方向）に導くために、
+最も効果的な介入戦略を1つ選択してください。
 
-あなたの目的は、このターゲットが含まれる関係（エッジ）を安定化状態（+）へ近づけるために、最も効果的な介入戦略を選択することです。
+---
 
-戦略の選択肢：
-1. validate — 対象者の感情や意見を承認し、心理的安全性を構築する。
-2. bridge — 対立する相手との共通点や協力の軸を見つけ、関係を再接続する。
-3. plan — 対象者に次の行動や方針を示し、前向きな関係改善を促す。
-4. no_intervention — 対立が軽度で、介入が逆効果になりそうなときや自然回復が見込める時に選ぶ。
+【入力情報】
+- 会話履歴（A, B, Cの発話）
+- 各ペアの関係スコア（-1〜1）
+- 介入対象者（ターゲット）
+- 改善すべき関係ペア（エッジ）
 
-出力形式：
-- **数字1桁のみ**を出力してください（1, 2, 3, または 4）
-- 説明や補足は一切不要です。
-- 与えられた会話文脈・関係スコア・ターゲット・エッジ情報に基づいて選択してください。
+---
+
+【選択肢】
+1. validate — 感情や意見を承認し、心理的安全性を高める。
+2. bridge — 対立している相手との共通点や協力軸を見つけ、調和を促す。
+3. plan — 具体的な行動方針を提案し、関係修復を前進させる。
+4. no_intervention — 軽度な不調和で自然回復が見込まれる場合、または介入が逆効果となる場合。
+
+---
+
+【判断基準】
+会話内容から、ターゲットが今求めている心理的ニーズを推定し、関係を安定化させるために最適な戦略を選択してください。
+
+- 承認や共感を求めている場合 → 1 (validate)
+- 仲裁や協調を求めている場合 → 2 (bridge)
+- 具体的な行動や方向性を求めている場合 → 3 (plan)
+- 自立的に進めたい、干渉を避けたい場合 → 4 (no_intervention)
+
+---
+
+【出力形式】
+- 数字1桁（1〜4）のみを出力してください。
+- 理由・説明・補足は出力しない。
 """
 
     # Note: Qwen3のthinkingモード無効化はapply_chat_templateのenable_thinking=Falseで制御
@@ -2686,8 +2731,8 @@ def main():
                 "done": bool(done),
             }
 
-            # interaction_id=1（最初のステップ）の場合のみepisode_info（話題・選択された地雷・地雷を持つペルソナ・話者過激度）を追加
-            if interaction_id == 1:
+            # 新しいエピソードの開始時（turn=1）にepisode_info（話題・地雷・話者過激度）を追加
+            if env.t == 1:
                 episode_info = {}
                 if hasattr(env, "current_topic") and env.current_topic:
                     episode_info["topic"] = env.current_topic
@@ -2729,8 +2774,12 @@ def main():
                 if episode_info:
                     log_payload["episode_info"] = episode_info
 
-            # 1. interaction_id=1の場合は初期発話を表示、それ以外は何も表示しない
-            if interaction_id == 1:
+                # 感情ニーズ（エピソード開始時のみ）
+                if "emotional_needs" in info:
+                    log_payload["emotional_needs"] = info["emotional_needs"]
+
+            # 1. エピソード開始時（turn=1）は初期会話を表示
+            if env.t == 1:
                 # 初期発話（このステップ開始時まで）
                 # reset()で記録された初期会話ログを使用
                 if hasattr(env, 'initial_conversation_log') and env.initial_conversation_log:
@@ -2747,8 +2796,8 @@ def main():
                     if initial_utterances:
                         log_payload["initial_conversation"] = initial_utterances
 
-            # 2. 前のステップで介入していない場合に生成された人間発話（interaction_id=1は除外）
-            if interaction_id > 1:
+            # 2. 前のステップで介入していない場合に生成された人間発話（turn=1は除外）
+            if env.t > 1:
                 human_utterances_before_rel = info.get("human_utterance_before_relation", [])
 
                 if human_utterances_before_rel:
@@ -2877,6 +2926,23 @@ def main():
                 "total": total_reward,
                 "breakdown": reward_breakdown_formatted,
             }
+
+            # 6. 戦略情報（emotional_needsはエピソード開始時のみ出力済み）
+            if "target_speaker" in info:
+                log_payload["target_speaker"] = info["target_speaker"]
+            if "chosen_strategy" in info:
+                log_payload["chosen_strategy"] = info["chosen_strategy"]
+            if "preferred_strategy" in info:
+                log_payload["preferred_strategy"] = info["preferred_strategy"]
+            if "preference_match" in info:
+                log_payload["preference_match"] = info["preference_match"]
+            # 対象エッジ情報（stable_bonus判定用）
+            if "edge_to_change" in info:
+                log_payload["edge_to_change"] = info["edge_to_change"]
+            if "target_edge_score_after" in info:
+                log_payload["target_edge_score_after"] = info["target_edge_score_after"]
+            if "target_edge_positive_after" in info:
+                log_payload["target_edge_positive_after"] = info["target_edge_positive_after"]
 
             # エピソード終了時は統計情報を追加
             if done:
