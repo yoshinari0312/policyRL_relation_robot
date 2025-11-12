@@ -164,7 +164,7 @@ def _scores_openai(logs: List[Dict], participants: List[str]) -> Dict[Tuple[str,
     res = client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[{"role":"user","content":prompt}],
-        temperature=0.2,
+        temperature=0,
     )
     txt = res.choices[0].message.content
     return _parse_score_lines(txt, participants)
@@ -200,7 +200,7 @@ def _scores_azure(logs: List[Dict], participants: List[str]) -> Dict[Tuple[str,s
 {outlines}
 """
     messages = [{"role":"user","content":prompt}]
-    params = build_chat_completion_params(deployment, messages, _CFG.llm, temperature=0.2)
+    params = build_chat_completion_params(deployment, messages, _CFG.llm, temperature=0)
     res = client.chat.completions.create(**params)
     txt = res.choices[0].message.content
     return _parse_score_lines(txt, participants)

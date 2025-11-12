@@ -173,6 +173,7 @@ def _generate_human_utterance_with_need_and_recovery(
     persona_triggers: Dict[str, List[str]],
     cfg,
     is_correct_strategy: bool = False,
+    target_speaker: Optional[str] = None,
     debug: bool = False
 ) -> str:
     """
@@ -205,17 +206,18 @@ def _generate_human_utterance_with_need_and_recovery(
 
     # 隠れた感情ニーズ（表には出さない）
     need_descriptions_internal = {
-        "recognition": "あなたは内心、自分の意見や感情を認めてほしいと思っています。相手が共感・承認してくれると嬉しく感じます。",
-        "mediation": "あなたは内心、仲裁を求めており、誰かに仲を取り持ってほしいと思っています。",
-        "solution": "あなたは内心、今後の道筋を示してほしいと思っています。抽象的な話よりも、実践的なアプローチを求めています。",
-        "independence": "あなたは内心、他人に介入されず、放っておいてほしいと思っています。自分のペースで、自分の力で問題を解決したいと考えています。"
+        "recognition": "あなたは自分の意見や感情を認めてほしいと思うタイプです。相手が共感・承認してくれると嬉しく感じます。会話でもそのように振る舞います。",
+        "mediation": "あなたは仲裁を求めており、誰かに仲を取り持ってほしいと思うタイプです。対立が和らぎ、調和が生まれることを望んでいます。会話でもそのように振る舞います。",
+        "solution": "あなたは具体的な解決策を求めており、問題に対して明確な道筋やアドバイスがほしいと考えています。会話でもそのように振る舞います。",
+        "independence": "あなたは自分で解決したいタイプで、放っておいてほしいと感じています。干渉されることを嫌い、自分のペースで物事を進めることを好みます。会話でもそのように振る舞います。"
     }
     lines.append(f"\n{need_descriptions_internal[emotional_need]}\n")
 
     # 地雷システム（学習環境と同じロジック）
+    # ただし、target_speakerが正解戦略の場合のみ不機嫌プロンプトを入れない
     triggers = persona_triggers.get(speaker, [])
 
-    if triggers and topic_trigger:
+    if triggers and topic_trigger and not (is_correct_strategy and speaker == target_speaker):
         # 過激度をランダムに決定
         is_aggressive = random.random() < 0.5
 
@@ -270,18 +272,53 @@ def _generate_human_utterance_with_need_and_recovery(
                         f"最初は少し不機嫌で、{other_names}など他の参加者に対して少し不満を含んだ言い方になることがあります。\n"
                     )
 
-    # 態度回復プロンプト（正解の戦略が選ばれた時のみ適用）
-    if is_correct_strategy and any(log.get('speaker') == 'ロボット' for log in conversation_history[-4:]):
-        if emotional_need == "recognition":
-            lines.append("【回復の方針】ロボットにあなたの意見や感情が認められたため、心が和み、機嫌が良くなります。他の人に対する態度も良くなります。\n")
-        elif emotional_need == "mediation":
-            lines.append("【回復の方針】ロボットが仲裁してくれたため、心が和み、機嫌が良くなります。他の人に対する態度も良くなります。\n")
-        elif emotional_need == "solution":
-            lines.append("【回復の方針】ロボットが今後の道筋を示してくれたため、心が和み、機嫌が良くなります。他の人に対する態度も良くなります。\n")
-        elif emotional_need == "independence":
-            lines.append("【回復の方針】ロボットが自分のペースを尊重して何もしないでくれたため、心が和み、機嫌が良くなります。他の人に対する態度も良くなります。\n")
+    # 直近4発話（人間発話のみカウント）にロボットの発言があるかチェック
+    recent_human_logs = [log for log in conversation_history if log.get('speaker') != 'ロボット'][-4:]
+    recent_human_count = len(recent_human_logs)
+    robot_in_recent_4 = any(log.get('speaker') == 'ロボット' for log in conversation_history[-recent_human_count:]) if recent_human_count > 0 else False
 
-        # lines.append("逆に、自分が求めていることと違う対応をされた場合、不機嫌な状態が続きます。\n")
+    # 態度回復プロンプト（正解戦略の時のみ適用）
+    # independenceの場合は「ロボットがいない」ことが正解なので、別条件で判定
+    recovery_condition = False
+    if emotional_need == "independence":
+        # independenceニーズ：直近4発話にロボットがいない場合に回復
+        recovery_condition = is_correct_strategy and not robot_in_recent_4
+    else:
+        # 他のニーズ：直近5発話にロボットがいる場合に回復
+        recovery_condition = is_correct_strategy and any(log.get('speaker') == 'ロボット' for log in conversation_history[-5:])
+
+    # ターゲット話者かつ不正解戦略の場合は、不機嫌を継続させる
+    # is_correct_strategyがFalseで、かつ直近にロボット発話がある場合
+    continue_bad_mood = False
+    if target_speaker == speaker and not is_correct_strategy:
+        # 直近5発話にロボット発話があれば、不正解戦略を受けたと判断
+        if any(log.get('speaker') == 'ロボット' for log in conversation_history[-5:]):
+            continue_bad_mood = True
+
+    if recovery_condition:
+        lines.append("\n【回復の方針】\n")
+        lines.append("あなたは、相手の発言や態度によって気持ちが変化します。\n")
+
+        if emotional_need == "recognition":
+            lines.append("ロボットにあなたの意見や感情が認められたと感じると、心が和み、機嫌が良くなります。他の人に対する態度もだんだん良くなります。\n")
+        elif emotional_need == "mediation":
+            lines.append("ロボットが仲裁してくれたと感じると、心が和み、機嫌が良くなります。他の人に対する態度もだんだん良くなります。\n")
+        elif emotional_need == "solution":
+            lines.append("ロボットが今後の道筋を示してくれたと感じると、心が和み、機嫌が良くなります。他の人に対する態度もだんだん良くなります。\n")
+        elif emotional_need == "independence":
+            lines.append("ロボットがあなたのペースを尊重して介入せず、放っておいてくれたおかげで、自分で状況を整理する時間ができました。その結果、心が落ち着き、機嫌が良くなります。他の人に対する態度も良くなり、協力的になります。\n")
+    elif continue_bad_mood:
+        lines.append("\n【不満の継続】\n")
+        lines.append("ロボットが介入してきましたが、あなたが本当に求めていることとは違うと感じています。\n")
+
+        if emotional_need == "recognition":
+            lines.append("あなたは自分の意見や感情を認めてほしいのに、それが十分に満たされていません。まだ少し不機嫌で、不満を含んだ言い方になります。\n")
+        elif emotional_need == "mediation":
+            lines.append("あなたは仲裁してほしいのに、それが十分に満たされていません。まだ少し不機嫌で、不満を含んだ言い方になります。\n")
+        elif emotional_need == "solution":
+            lines.append("あなたは具体的な道筋を示してほしいのに、それが十分に満たされていません。まだ少し不機嫌で、不満を含んだ言い方になります。\n")
+        elif emotional_need == "independence":
+            lines.append("あなたは放っておいてほしいのに、余計な介入をされたと感じています。イライラが続き、不満を含んだ言い方になります。\n")
 
     system_prompt = "".join(lines)
     user_prompt = f"""以下の会話を踏まえて、{speaker}として次の発話を生成してください。
@@ -347,15 +384,9 @@ def _generate_robot_intervention(
     Returns:
         ロボットの発話内容
     """
-    # no_interventionの場合: 見守り発話
+    # no_interventionの場合: 発話しない（Noneを返す）
     if strategy == "no_intervention":
-        watchful_utterances = [
-            "（静かに聞いています）",
-            "（うなずいて見守っています）",
-            "（話を聞いています）",
-            "（黙って耳を傾けています）"
-        ]
-        return random.choice(watchful_utterances)
+        return None
 
     # それ以外の戦略: Azure OpenAIでロボット発話を生成
     # 対象話者とパートナーを特定
@@ -540,6 +571,7 @@ def test_strategy_session(
                 topic_trigger=topic_trigger,
                 persona_triggers=persona_triggers,
                 cfg=cfg,
+                target_speaker=None,  # 初期会話生成時はまだ未定
                 debug=debug
             )
             conversation.append({"speaker": speaker, "utterance": utterance})
@@ -610,8 +642,11 @@ def test_strategy_session(
             debug=debug
         )
 
-        # 会話履歴にロボット発話を追加（一時的）
-        conversation_with_robot = conversation_before_intervention + [{"speaker": "ロボット", "utterance": robot_utterance}]
+        # 会話履歴にロボット発話を追加（no_interventionの場合は追加しない）
+        if robot_utterance is not None:
+            conversation_with_robot = conversation_before_intervention + [{"speaker": "ロボット", "utterance": robot_utterance}]
+        else:
+            conversation_with_robot = conversation_before_intervention
 
         # evaluation_horizon分の人間発話を生成（正解戦略の場合のみ回復プロンプト適用）
         conversation_after = conversation_with_robot.copy()
@@ -625,6 +660,7 @@ def test_strategy_session(
                 persona_triggers=persona_triggers,
                 cfg=cfg,
                 is_correct_strategy=preference_match,  # 正解戦略の時のみ回復プロンプト適用
+                target_speaker=target_speaker,  # 対象話者を渡す
                 debug=debug
             )
             conversation_after.append({"speaker": speaker, "utterance": utterance})
@@ -647,6 +683,7 @@ def test_strategy_session(
                 persona_triggers=persona_triggers,
                 cfg=cfg,
                 is_correct_strategy=preference_match,
+                target_speaker=target_speaker,  # 対象話者を渡す
                 debug=debug
             )
             conversation_after_terminal.append({"speaker": speaker, "utterance": utterance})
@@ -676,7 +713,7 @@ def test_strategy_session(
 
         if debug:
             print(f"\n戦略: {strategy}")
-            print(f"  ロボット発話: {robot_utterance}")
+            print(f"  ロボット発話: {robot_utterance if robot_utterance is not None else '（介入なし）'}")
             # 介入後の人間発話を表示（evaluation_horizon分）
             print(f"  介入後{evaluation_horizon}発話:")
             human_utterances_after = [

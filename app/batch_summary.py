@@ -25,6 +25,9 @@ class BatchSummaryCollector:
         # 戦略のカウント（バッチ全体で蓄積）
         self.strategy_counts = defaultdict(int)
 
+        # 戦略別の正解カウント
+        self.strategy_correct_counts = defaultdict(int)
+
     def add_reward(self, reward: float):
         """報酬を記録"""
         self.total_reward += reward
@@ -38,6 +41,7 @@ class BatchSummaryCollector:
         self.decision_counter += 1
 
         strategy = plan_obj.get("strategy", None)
+        preference_match = plan_obj.get("preference_match", False)
 
         if strategy == "output_error":
             # LLMの出力が不正だった場合
@@ -47,10 +51,16 @@ class BatchSummaryCollector:
             # 実際に介入した場合
             self.strategy_counts[strategy] += 1
             self.intervention_count += 1
+            # 正解の場合はカウント
+            if preference_match:
+                self.strategy_correct_counts[strategy] += 1
         elif strategy is None and not plan_obj.get("intervene_now", False):
             # モデルが"4"（no_intervention）を出力した場合
             self.strategy_counts["no_intervention"] += 1
             self.no_intervention_count += 1
+            # 正解の場合はカウント
+            if preference_match:
+                self.strategy_correct_counts["no_intervention"] += 1
         else:
             # 予期しないケース（デバッグ用）
             print(f"[BatchSummaryCollector] 予期しないplan_obj: {plan_obj}")
@@ -77,6 +87,16 @@ class BatchSummaryCollector:
             "strategy": self._compute_entropy(self.strategy_counts),
         }
 
+        # 戦略別の正解率を計算
+        strategy_accuracy = {}
+        for strategy in ["validate", "bridge", "plan", "no_intervention"]:
+            count = self.strategy_counts.get(strategy, 0)
+            correct = self.strategy_correct_counts.get(strategy, 0)
+            if count > 0:
+                strategy_accuracy[strategy] = correct / count
+            else:
+                strategy_accuracy[strategy] = 0.0
+
         summary = {
             "batch_id": self.batch_count,
             "batch_size": self.batch_size,
@@ -86,6 +106,8 @@ class BatchSummaryCollector:
             "output_error_count": self.output_error_count,
             "choice_entropy": choice_entropy,
             "strategy_counts": dict(self.strategy_counts),
+            "strategy_correct_counts": dict(self.strategy_correct_counts),
+            "strategy_accuracy": strategy_accuracy,
         }
 
         # KL係数と学習率を記録（指定されている場合）

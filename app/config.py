@@ -176,6 +176,11 @@ class PPOCfg:
     entropy_coef_phase3: Optional[float] = None  # エントロピー係数（フェーズ3）
     entropy_transition_updates: Optional[List[int]] = None  # エントロピー係数の変更タイミング
     max_entropy_bonus: Optional[float] = None  # エントロピーボーナスの上限
+    
+    # フェーズ別目標エントロピー
+    entropy_target_phase1: Optional[float] = None  # フェーズ1の目標エントロピー
+    entropy_target_phase2: Optional[float] = None  # フェーズ2の目標エントロピー
+    entropy_target_phase3: Optional[float] = None  # フェーズ3の目標エントロピー
     filter_zero_rewards: Optional[bool] = None
     whiten_rewards: Optional[bool] = None  # 報酬の正規化
     topic_overlap_weight: Optional[float] = None

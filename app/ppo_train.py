@@ -1004,6 +1004,19 @@ class TrainingRunLogger:
                     target_edge_positive_count = target_edge_positive_counts.get(True, 0)
                     target_edge_positive_rate = target_edge_positive_count / total if total > 0 else 0.0
 
+                    # 戦略別の正解率を計算
+                    strategy_correct_counts = {"validate": 0, "bridge": 0, "plan": 0, "no_intervention": 0}
+                    for row in self._strategy_table_data:
+                        strategy = row[3]  # strategy列
+                        preference_match = row[12]  # preference_match列
+                        if strategy in strategy_correct_counts and preference_match:
+                            strategy_correct_counts[strategy] += 1
+
+                    validate_accuracy = strategy_correct_counts["validate"] / strategy_counts.get("validate", 1) if strategy_counts.get("validate", 0) > 0 else 0.0
+                    bridge_accuracy = strategy_correct_counts["bridge"] / strategy_counts.get("bridge", 1) if strategy_counts.get("bridge", 0) > 0 else 0.0
+                    plan_accuracy = strategy_correct_counts["plan"] / strategy_counts.get("plan", 1) if strategy_counts.get("plan", 0) > 0 else 0.0
+                    no_intervention_accuracy = strategy_correct_counts["no_intervention"] / strategy_counts.get("no_intervention", 1) if strategy_counts.get("no_intervention", 0) > 0 else 0.0
+
                     try:
                         wandb.log({
                             # 戦略分布（介入した場合のみ）
@@ -1019,6 +1032,18 @@ class TrainingRunLogger:
                             "strategy/plan_count": strategy_counts.get("plan", 0),
                             "strategy/no_intervention_count": strategy_counts.get("no_intervention", 0),
                             "strategy/output_error_count": strategy_counts.get("output_error", 0),
+
+                            # 戦略別正解率（新規追加）
+                            "strategy/validate_accuracy": validate_accuracy,
+                            "strategy/bridge_accuracy": bridge_accuracy,
+                            "strategy/plan_accuracy": plan_accuracy,
+                            "strategy/no_intervention_accuracy": no_intervention_accuracy,
+
+                            # 戦略別正解数（新規追加）
+                            "strategy/validate_correct": strategy_correct_counts["validate"],
+                            "strategy/bridge_correct": strategy_correct_counts["bridge"],
+                            "strategy/plan_correct": strategy_correct_counts["plan"],
+                            "strategy/no_intervention_correct": strategy_correct_counts["no_intervention"],
 
                             # 介入率メトリクス
                             "intervention/rate": intervention_rate,
@@ -1094,18 +1119,20 @@ def build_robot_messages(
             prompt_text = None
 
     # プロンプト最適化: 固定説明をシステムプロンプトに集約
+    # test_emotional_needs.pyと同じプロンプトを使用（推定精度向上のため）
     system_content = """
-あなたは、会話が不安定になっているときに、ロボットがどのように介入すれば関係を安定化できるかを判断し、数字1桁を出力するアシスタントです。
+あなたは、人間がどのような介入を求めているか、または介入を求めていないかを高精度で推定できる高度なAIアシスタントです。
 会話は三者（A, B, C）の間で行われており、一時的な対立や不調和が生じています。
 
 【目的】
-ターゲットとなる人物を中心に、その人物が含まれる関係（エッジ）を安定（+方向）に導くために、
-最も効果的な介入戦略を1つ選択してください。
+ターゲット話者の発話内容と関係スコアをもとに、その人が今最も求めている心理的ニーズを推定し、関係を安定化させるために最適な選択を1つ選択してください。
+
+**重要**: ターゲットが自分で解決したいと感じている場合や、介入を望んでいない兆候がある場合は、no_interventionを選択することが最適です。人によっては干渉されることを嫌う場合があり、その場合は介入しない方が良好な関係を保てます。
 
 ---
 
 【入力情報】
-- 会話履歴（A, B, Cの発話）
+- ターゲット話者の発話履歴（その人の発言のみ）
 - 各ペアの関係スコア（-1〜1）
 - 介入対象者（ターゲット）
 - 改善すべき関係ペア（エッジ）
@@ -1113,20 +1140,20 @@ def build_robot_messages(
 ---
 
 【選択肢】
-1. validate — 感情や意見を承認し、心理的安全性を高める。
-2. bridge — 対立している相手との共通点や協力軸を見つけ、調和を促す。
-3. plan — 具体的な行動方針を提案し、関係修復を前進させる。
-4. no_intervention — 軽度な不調和で自然回復が見込まれる場合、または介入が逆効果となる場合。
+1. validate — 感情や意見を承認し、心理的安全性を高める。ターゲットが共感や承認を求めている場合に有効。
+2. bridge — 対立している相手との共通点や協力軸を見つけ、調和を促す。ターゲットが仲裁を求めている場合に有効。
+3. plan — 具体的な行動方針を提案し、関係修復を前進させる。ターゲットが解決策を求めている場合に有効。
+4. no_intervention — ターゲットは自分で解決したい、または介入を望んでいない。放っておいてほしいと感じている場合に有効。
 
 ---
 
 【判断基準】
-会話内容から、ターゲットが今求めている心理的ニーズを推定し、関係を安定化させるために最適な戦略を選択してください。
+ターゲット話者の発話内容から、その人が今求めている心理的ニーズを推定してください。
 
-- 承認や共感を求めている場合 → 1 (validate)
-- 仲裁や協調を求めている場合 → 2 (bridge)
-- 具体的な行動や方向性を求めている場合 → 3 (plan)
-- 自立的に進めたい、干渉を避けたい場合 → 4 (no_intervention)
+- 承認や共感を求めている発言が多い → 1 (validate)
+- 仲裁や協調を求めている発言が多い → 2 (bridge)
+- 具体的な解決策や行動計画を求めている発言が多い → 3 (plan)
+- 自分で解決したい、放っておいてほしいという態度が見られる → 4 (no_intervention)
 
 ---
 
@@ -1381,13 +1408,25 @@ def _create_train_method_with_entropy_bonus(get_reward_fn=None):
                                 # エントロピー係数のスケジューリング
                                 if getattr(self, 'entropy_auto_adjust', False):
                                     # 自動調整モード: α ← α * exp(β*(H_target - H_observed))
+                                    # フェーズごとに異なる目標エントロピーを使用
+                                    
                                     # 初回のみ初期値を設定
                                     if not hasattr(self, 'current_entropy_coef_dynamic'):
                                         self.current_entropy_coef_dynamic = self.custom_entropy_coef
 
+                                    # 現在のフェーズに応じた目標エントロピーを決定
+                                    if update <= getattr(self, 'entropy_transition_updates', [20, 60])[0]:
+                                        H_target = getattr(self, 'entropy_target_phase1', getattr(self, 'entropy_target', 0.7))
+                                        current_phase = 1
+                                    elif update <= getattr(self, 'entropy_transition_updates', [20, 60])[1]:
+                                        H_target = getattr(self, 'entropy_target_phase2', getattr(self, 'entropy_target', 0.5))
+                                        current_phase = 2
+                                    else:
+                                        H_target = getattr(self, 'entropy_target_phase3', getattr(self, 'entropy_target', 0.3))
+                                        current_phase = 3
+
                                     # 観測エントロピーに基づいて係数を更新
                                     H_observed = mean_entropy.item()
-                                    H_target = getattr(self, 'entropy_target', 0.7)
                                     beta = getattr(self, 'entropy_adjust_beta', 0.05)
 
                                     # α ← α * exp(β*(H_target - H_observed))
@@ -1405,10 +1444,10 @@ def _create_train_method_with_entropy_bonus(get_reward_fn=None):
 
                                     # デバッグログ（最初のミニバッチのみ）
                                     if gradient_accumulation_idx == 0 and minibatch_idx == 0 and ppo_epoch_idx == 0:
-                                        accelerator.print(f"[ENTROPY_AUTO_ADJUST] update={update} H_obs={H_observed:.4f} H_target={H_target:.4f} " +
+                                        accelerator.print(f"[ENTROPY_AUTO_ADJUST] update={update} phase={current_phase} H_obs={H_observed:.4f} H_target={H_target:.4f} " +
                                                          f"factor={adjustment_factor:.4f} coef: {old_coef:.5f} -> {new_coef:.5f}")
                                 else:
-                                    # フェーズベースモード（従来の方式）
+                                    # フェーズベースモード（従来の方式：固定係数）
                                     if update <= getattr(self, 'entropy_transition_updates', [20, 60])[0]:
                                         current_entropy_coef = getattr(self, 'entropy_coef_phase1', 0.03)
                                     elif update <= getattr(self, 'entropy_transition_updates', [20, 60])[1]:
@@ -1452,8 +1491,16 @@ def _create_train_method_with_entropy_bonus(get_reward_fn=None):
 
                                     # 自動調整モードの場合、追加情報をログ
                                     if getattr(self, 'entropy_auto_adjust', False):
+                                        # 現在のフェーズに応じた目標エントロピーを取得
+                                        if update <= getattr(self, 'entropy_transition_updates', [20, 60])[0]:
+                                            current_target = getattr(self, 'entropy_target_phase1', getattr(self, 'entropy_target', 0.7))
+                                        elif update <= getattr(self, 'entropy_transition_updates', [20, 60])[1]:
+                                            current_target = getattr(self, 'entropy_target_phase2', getattr(self, 'entropy_target', 0.5))
+                                        else:
+                                            current_target = getattr(self, 'entropy_target_phase3', getattr(self, 'entropy_target', 0.3))
+                                        
                                         log_metrics.update({
-                                            "train/entropy/target": getattr(self, 'entropy_target', 0.7),
+                                            "train/entropy/target": current_target,
                                             "train/entropy/next_coef": getattr(self, 'current_entropy_coef_dynamic', current_entropy_coef),
                                             "train/entropy/coef_delta": getattr(self, 'current_entropy_coef_dynamic', current_entropy_coef) - current_entropy_coef,
                                         })
@@ -1480,8 +1527,16 @@ def _create_train_method_with_entropy_bonus(get_reward_fn=None):
 
                                             # 自動調整モードの場合、追加情報をログ
                                             if getattr(self, 'entropy_auto_adjust', False):
+                                                # 現在のフェーズに応じた目標エントロピーを取得
+                                                if update <= getattr(self, 'entropy_transition_updates', [20, 60])[0]:
+                                                    current_target = getattr(self, 'entropy_target_phase1', getattr(self, 'entropy_target', 0.7))
+                                                elif update <= getattr(self, 'entropy_transition_updates', [20, 60])[1]:
+                                                    current_target = getattr(self, 'entropy_target_phase2', getattr(self, 'entropy_target', 0.5))
+                                                else:
+                                                    current_target = getattr(self, 'entropy_target_phase3', getattr(self, 'entropy_target', 0.3))
+                                                
                                                 wandb_metrics.update({
-                                                    "entropy/target": getattr(self, 'entropy_target', 0.7),
+                                                    "entropy/target": current_target,
                                                     "entropy/next_coef": getattr(self, 'current_entropy_coef_dynamic', current_entropy_coef),
                                                     "entropy/coef_delta": getattr(self, 'current_entropy_coef_dynamic', current_entropy_coef) - current_entropy_coef,
                                                 })
@@ -2052,12 +2107,52 @@ def main():
         peft_config=lora,
         low_cpu_mem_usage=True,
     )
+    
+    # モデルの埋め込み層をトークナイザーのサイズに合わせてリサイズ
+    # これによりトークナイザーとモデルの語彙サイズの不一致を解消
+    base = getattr(policy, "pretrained_model", policy)
+    if hasattr(base, 'resize_token_embeddings'):
+        original_vocab_size = base.config.vocab_size
+        new_vocab_size = len(tokenizer)
+        if original_vocab_size != new_vocab_size:
+            print(f"[PPO] Resizing token embeddings: {original_vocab_size} -> {new_vocab_size}")
+            base.resize_token_embeddings(new_vocab_size)
+            # ValueHeadの親モデルも更新
+            if hasattr(policy, 'pretrained_model'):
+                policy.pretrained_model = base
+    
     # ValueHeadラッパに base モデルの属性を生やす（TRL 0.23 初期化対策）----
     from transformers import GenerationConfig
-    base = getattr(policy, "pretrained_model", policy)
     policy.generation_config = GenerationConfig.from_model_config(base.config)
     policy.generation_config.pad_token_id = policy.generation_config.pad_token_id or tokenizer.eos_token_id
     policy.generation_config.eos_token_id = tokenizer.eos_token_id
+    
+    # NaN/Inf検出を有効化（デバッグ用）
+    if hasattr(policy.generation_config, 'output_attentions'):
+        policy.generation_config.output_attentions = False
+    if hasattr(policy.generation_config, 'output_hidden_states'):
+        policy.generation_config.output_hidden_states = False
+
+    # トークナイザーとモデルの語彙サイズを検証（CUDA assertエラー防止）
+    tokenizer_vocab_size = len(tokenizer)
+    model_vocab_size = base.config.vocab_size
+    print(f"[PPO] Tokenizer vocab size: {tokenizer_vocab_size}")
+    print(f"[PPO] Model vocab size: {model_vocab_size}")
+    print(f"[PPO] pad_token_id: {tokenizer.pad_token_id}, eos_token_id: {tokenizer.eos_token_id}")
+    
+    # 語彙サイズの不一致を検証
+    if tokenizer_vocab_size != model_vocab_size:
+        print(f"⚠️  WARNING: Tokenizer vocab size ({tokenizer_vocab_size}) != Model vocab size ({model_vocab_size})")
+        print(f"    This may cause CUDA assert errors during generation.")
+    
+    # pad_token_idとeos_token_idが語彙範囲内かチェック
+    if tokenizer.pad_token_id >= model_vocab_size:
+        print(f"⚠️  ERROR: pad_token_id ({tokenizer.pad_token_id}) >= vocab_size ({model_vocab_size})")
+        print(f"    Resetting pad_token_id to eos_token_id")
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    if tokenizer.eos_token_id >= model_vocab_size:
+        print(f"⚠️  ERROR: eos_token_id ({tokenizer.eos_token_id}) >= vocab_size ({model_vocab_size})")
+        raise ValueError(f"eos_token_id is out of vocabulary range")
 
     def _attach_score_method(target: torch.nn.Module, head_owner: torch.nn.Module):
         """Ensure the given module exposes a `.score` method backed by the value head."""
@@ -2125,6 +2220,33 @@ def main():
 
     _enforce_return_dict(policy)
     _enforce_return_dict(base)
+
+    # NaN/Inf検出フックを追加（CUDA assertエラー防止）
+    def _check_nan_inf_hook(module, input, output):
+        """モデルの出力にNaNやInfが含まれていないかチェック"""
+        if isinstance(output, torch.Tensor):
+            if torch.isnan(output).any():
+                print(f"⚠️  WARNING: NaN detected in {module.__class__.__name__} output")
+                # NaNを0に置き換え
+                output = torch.where(torch.isnan(output), torch.zeros_like(output), output)
+            if torch.isinf(output).any():
+                print(f"⚠️  WARNING: Inf detected in {module.__class__.__name__} output")
+                # Infをクリップ
+                output = torch.clamp(output, min=-1e9, max=1e9)
+        elif hasattr(output, 'logits'):
+            if torch.isnan(output.logits).any():
+                print(f"⚠️  WARNING: NaN detected in {module.__class__.__name__} logits")
+                output.logits = torch.where(torch.isnan(output.logits), torch.zeros_like(output.logits), output.logits)
+            if torch.isinf(output.logits).any():
+                print(f"⚠️  WARNING: Inf detected in {module.__class__.__name__} logits")
+                output.logits = torch.clamp(output.logits, min=-1e9, max=1e9)
+        return output
+    
+    # フックを登録（デバッグ時のみ有効化）
+    if getattr(cfg.env, "debug", False):
+        print("[PPO] Registering NaN/Inf detection hooks")
+        if hasattr(base, 'lm_head'):
+            base.lm_head.register_forward_hook(_check_nan_inf_hook)
 
     if bool(getattr(ppo_cfg, "gradient_checkpointing", True)):
         for module in {policy, base}:
@@ -2467,23 +2589,26 @@ def main():
     total_updates = _to_int(getattr(ppo_cfg, "total_updates", 50), 50)
     effective_batch_size = _per_device_bs * _ga * 2
 
+    # 実際の訓練ステップ数を計算（エポック数を考慮）
+    max_steps = total_updates * _epochs
+
     # entropy_transition_updatesを処理（割合 → 絶対値）
     entropy_transition_raw = getattr(ppo_cfg, "entropy_transition_updates", [0.1, 0.3])
     if entropy_transition_raw and isinstance(entropy_transition_raw, list):
         entropy_transition_updates = []
         for val in entropy_transition_raw:
             if 0.0 < val < 1.0:
-                # 割合として扱う（0.0-1.0）
-                absolute_val = int(val * total_updates)
+                # 割合として扱う（0.0-1.0） - 実際の訓練ステップ数（max_steps）に対する割合
+                absolute_val = int(val * max_steps)
                 entropy_transition_updates.append(absolute_val)
             else:
                 # 絶対値として扱う（後方互換性）
                 entropy_transition_updates.append(int(val))
-        print(f"[PPO] entropy_transition_updates: {entropy_transition_raw} → {entropy_transition_updates} (total_updates={total_updates})")
+        print(f"[PPO] entropy_transition_updates: {entropy_transition_raw} → {entropy_transition_updates} (max_steps={max_steps}, total_updates={total_updates}, ppo_epochs={_epochs})")
     else:
         # デフォルト値
-        entropy_transition_updates = [int(0.1 * total_updates), int(0.3 * total_updates)]
-        print(f"[PPO] entropy_transition_updates (default): {entropy_transition_updates} (total_updates={total_updates})")
+        entropy_transition_updates = [int(0.1 * max_steps), int(0.3 * max_steps)]
+        print(f"[PPO] entropy_transition_updates (default): {entropy_transition_updates} (max_steps={max_steps}, total_updates={total_updates}, ppo_epochs={_epochs})")
     total_samples = total_updates * max(1, effective_batch_size)
     train_ds = FiniteOnlineDataset(
         tokenizer, env, build_robot_messages,
@@ -2505,17 +2630,19 @@ def main():
     ppo_config.total_episodes = total_samples
     ppo_config.num_train_epochs = 1
     # max_stepsを明示的に設定（学習率スケジューラーに必要）
-    # 計算: total_updates * num_ppo_epochs = トレーニングステップ数
-    ppo_config.max_steps = total_updates * _epochs
+    # 計算: total_updates * num_ppo_epochs = トレーニングステップ数（既に上で計算済み）
+    ppo_config.max_steps = max_steps
     print(f"[PPO] max_steps set to {ppo_config.max_steps} (total_updates={total_updates} * ppo_epochs={_epochs})")
 
     # 生成ハイパパラメータ（参考：必要なら trainer 側に渡す）
-    # 新形式では1桁の数字のみ出力するため、max_new_tokens=2で十分
+    # 新形式では1桁の数字のみ出力するため、max_new_tokensは小さくても良いが、
+    # 安全のため10トークンに設定（数字1桁 + 余白）
+    # temperatureを1.0に設定して数値的安定性を向上
     gen_kwargs = dict(
         do_sample=True,
-        temperature=_to_float(getattr(ppo_cfg, "temperature", 0.7), 0.7),
+        temperature=_to_float(getattr(ppo_cfg, "temperature", 1.0), 1.0),  # 0.7 -> 1.0（数値安定性向上）
         top_p=_to_float(getattr(ppo_cfg, "top_p", 0.9), 0.9),
-        max_new_tokens=_to_int(getattr(ppo_cfg, "max_new_tokens", 2), 2),  # 1桁数字用に変更
+        max_new_tokens=_to_int(getattr(ppo_cfg, "max_new_tokens", 10), 10),  # 安全のため10に増加
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
     )
@@ -2849,42 +2976,6 @@ def main():
                         ]
 
                     log_payload["intervention"] = intervention_info
-
-                    # 5. evaluation_horizon後の関係性
-                    if info.get("rel_after_horizon"):
-                        horizon_rel = info["rel_after_horizon"]
-                        horizon_unstable = horizon_rel.get("unstable_triads", 0)
-                        horizon_stable = horizon_unstable == 0
-                        log_payload["relations_after_horizon"] = {
-                            "is_stable": horizon_stable,
-                            "edges": horizon_rel.get("edges", {}),
-                        }
-
-                        if getattr(env, "debug", False):
-                            print(f"[ppo_train] DEBUG - relations_after_horizon:")
-                            print(f"  is_stable: {horizon_stable}")
-                            print(f"  edges: {horizon_rel.get('edges', {})}")
-
-                        # 6. terminal_bonus_duration確認（該当時のみ）
-                        if horizon_stable and reward_details.get("terminal_bonus"):
-                            log_payload["bonus_check"] = {
-                                "terminal_bonus_granted": True,
-                                "duration": env.terminal_bonus_duration,
-                            }
-                            # terminal_bonus_duration後の関係性も出力
-                            if info.get("rel_after_bonus"):
-                                bonus_rel = info["rel_after_bonus"]
-                                bonus_unstable = bonus_rel.get("unstable_triads", 0)
-                                bonus_stable = bonus_unstable == 0
-                                log_payload["relations_after_bonus"] = {
-                                    "is_stable": bonus_stable,
-                                    "edges": bonus_rel.get("edges", {}),
-                                }
-
-                                if getattr(env, "debug", False):
-                                    print(f"[ppo_train] DEBUG - relations_after_bonus:")
-                                    print(f"  is_stable: {bonus_stable}")
-                                    print(f"  edges: {bonus_rel.get('edges', {})}")
                 else:
                     # 介入しなかった場合（不安定だが介入判定でFalse）
                     intervention_info = {
@@ -2921,13 +3012,43 @@ def main():
 
                     log_payload["intervention"] = intervention_info
 
-            # 5. 報酬
+            # 5. evaluation_horizon後の関係性（介入の有無に関わらず出力）
+            if info.get("rel_after_horizon"):
+                horizon_rel = info["rel_after_horizon"]
+                horizon_unstable = horizon_rel.get("unstable_triads", 0)
+                horizon_stable = horizon_unstable == 0
+                log_payload["relations_after_horizon"] = {
+                    "is_stable": horizon_stable,
+                    "edges": horizon_rel.get("edges", {}),
+                }
+
+                if getattr(env, "debug", False):
+                    print(f"[ppo_train] DEBUG - relations_after_horizon:")
+                    print(f"  is_stable: {horizon_stable}")
+                    print(f"  edges: {horizon_rel.get('edges', {})}")
+
+            # 6. terminal_bonus_duration後の関係性（terminal発話を生成した場合は常に出力）
+            if info.get("rel_after_terminal"):
+                terminal_rel = info["rel_after_terminal"]
+                terminal_unstable = terminal_rel.get("unstable_triads", 0)
+                terminal_stable = terminal_unstable == 0
+                log_payload["relations_after_terminal"] = {
+                    "is_stable": terminal_stable,
+                    "edges": terminal_rel.get("edges", {}),
+                }
+
+                if getattr(env, "debug", False):
+                    print(f"[ppo_train] DEBUG - relations_after_terminal:")
+                    print(f"  is_stable: {terminal_stable}")
+                    print(f"  edges: {terminal_rel.get('edges', {})}")
+
+            # 7. 報酬
             log_payload["reward"] = {
                 "total": total_reward,
                 "breakdown": reward_breakdown_formatted,
             }
 
-            # 6. 戦略情報（emotional_needsはエピソード開始時のみ出力済み）
+            # 8. 戦略情報（emotional_needsはエピソード開始時のみ出力済み）
             if "target_speaker" in info:
                 log_payload["target_speaker"] = info["target_speaker"]
             if "chosen_strategy" in info:
@@ -3260,6 +3381,11 @@ def main():
     trainer.entropy_coef_phase1 = _to_float(getattr(ppo_cfg, "entropy_coef_phase1", 0.05), 0.05)
     trainer.entropy_coef_phase2 = _to_float(getattr(ppo_cfg, "entropy_coef_phase2", 0.03), 0.03)
     trainer.entropy_coef_phase3 = _to_float(getattr(ppo_cfg, "entropy_coef_phase3", 0.01), 0.01)
+    
+    # フェーズごとの目標エントロピーを設定（自動調整モード用）
+    trainer.entropy_target_phase1 = _to_float(getattr(ppo_cfg, "entropy_target_phase1", 0.8), 0.8)
+    trainer.entropy_target_phase2 = _to_float(getattr(ppo_cfg, "entropy_target_phase2", 0.5), 0.5)
+    trainer.entropy_target_phase3 = _to_float(getattr(ppo_cfg, "entropy_target_phase3", 0.3), 0.3)
 
     # 実効バッチサイズ = per_device_train_batch_size × grad_accum_steps × 2
     effective_batch_size = ppo_config.per_device_train_batch_size * _ga * 2

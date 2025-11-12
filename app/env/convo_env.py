@@ -211,9 +211,13 @@ class ConversationEnv:
         self.terminal_bonus = float(terminal_bonus) if terminal_bonus is not None else float(getattr(cfg.env, "terminal_bonus", 0.25))
         self.intervention_cost = float(intervention_cost) if intervention_cost is not None else float(getattr(cfg.env, "intervention_cost", 0.02))
 
-        # 新しい報酬パラメータ（感情ニーズベース）
-        self.stable_bonus = float(getattr(cfg.env, "stable_bonus", 2.0))
+        # 新しい報酬パラメータ（感情ニーズベース + 2段階ボーナス）
+        self.horizon_bonus = float(getattr(cfg.env, "horizon_bonus", 1.0))
+        self.terminal_bonus_reward = float(getattr(cfg.env, "terminal_bonus", 1.0))  # terminal_bonus（属性名衝突回避）
         self.preference_match_bonus = float(getattr(cfg.env, "preference_match_bonus", 0.5))
+
+        # 旧パラメータ（互換性維持）
+        self.stable_bonus = float(getattr(cfg.env, "stable_bonus", 2.0))
 
         # その他のパラメータをYAMLから読み込み
         self.min_robot_intervention_lookback = int(getattr(cfg.env, "min_robot_intervention_lookback", 6))
@@ -319,6 +323,11 @@ class ConversationEnv:
         self.previous_rel_after_horizon = None
         self.previous_rel_after_bonus = None
 
+        # ターゲット選択のリセット（1ターンで1回だけ選択するため）
+        self._last_target_selection_turn = -1
+        self._current_target_edge = None
+        self._current_target_speaker = None
+
         # エピソードごとに各話者の過激度を設定（50%の確率でマイルドまたは過激）
         import random
         self.speaker_aggressiveness = {}
@@ -345,7 +354,11 @@ class ConversationEnv:
         self.used_topics.append(self.current_topic)
 
         # 初期会話を生成（evaluation_horizon回のターン = 通常1ラウンド）
-        self._bootstrap_humans(self.evaluation_horizon)
+        # 感情ニーズを渡すが、まだ介入前なのでtarget_speakerはNone
+        self._bootstrap_humans(
+            self.evaluation_horizon,
+            emotional_needs=self.persona_emotional_needs
+        )
 
         # 安定状態の自動スキップ（初期会話でも適用）
         # step()と同様に、安定であればmax_auto_skip回まで人間発話を生成
@@ -387,7 +400,15 @@ class ConversationEnv:
                     if self.debug:
                         print(f"  [reset auto_skip] 安定状態を検出、人間発話を自動生成 ({auto_skip_count}/{max_auto_skip})")
 
-                    replies = human_reply(self.logs, self.persona_pool, topic=self.current_topic, topic_trigger=self.current_topic_trigger, num_speakers=1, speaker_aggressiveness=self.speaker_aggressiveness)
+                    replies = human_reply(
+                        self.logs,
+                        self.persona_pool,
+                        topic=self.current_topic,
+                        topic_trigger=self.current_topic_trigger,
+                        num_speakers=1,
+                        speaker_aggressiveness=self.speaker_aggressiveness,
+                        emotional_needs=self.persona_emotional_needs
+                    )
                     if replies:
                         self.logs.extend(replies)
                         # 初期会話ログにも追加
@@ -427,7 +448,10 @@ class ConversationEnv:
             # ログをクリアして新しいトピックで初期会話を生成
             self.logs = []
             self.scorer = RelationScorer(**self._scorer_kwargs)
-            self._bootstrap_humans(self.evaluation_horizon)
+            self._bootstrap_humans(
+                self.evaluation_horizon,
+                emotional_needs=self.persona_emotional_needs
+            )
 
         observation = self._make_observation()
         self._last_observation = observation
@@ -487,7 +511,15 @@ class ConversationEnv:
                     print(f"  ステップ1: reset()で既に{len(self.logs)}発話生成済み")
         else:
             # 人間1発話生成
-            replies = human_reply(self.logs, self.persona_pool, topic=self.current_topic, topic_trigger=self.current_topic_trigger, num_speakers=1, speaker_aggressiveness=self.speaker_aggressiveness)
+            replies = human_reply(
+                self.logs,
+                self.persona_pool,
+                topic=self.current_topic,
+                topic_trigger=self.current_topic_trigger,
+                num_speakers=1,
+                speaker_aggressiveness=self.speaker_aggressiveness,
+                emotional_needs=self.persona_emotional_needs
+            )
             if replies:
                 self.logs.extend(replies)
                 human_replies_before = replies  # 生成した人間発話を保存
@@ -530,6 +562,9 @@ class ConversationEnv:
                         "unstable_triads": metrics_init.get("unstable_triads", 0),
                         "edges": metrics_init.get("edges", {}),
                     }
+                    # 初期評価結果を保存（ループが実行されなかった場合に使用）
+                    final_rel_metrics = metrics_init
+                    final_rel_scores = scores_init
                     if self.debug:
                         print(f"  [auto_skip] 初期関係性を評価: unstable_triads={metrics_init.get('unstable_triads', 0)}")
             except Exception as e:
@@ -562,7 +597,15 @@ class ConversationEnv:
             if self.debug:
                 print(f"  [auto_skip] 安定状態を検出、人間発話を自動生成 ({auto_skip_count}/{max_auto_skip})")
 
-            replies = human_reply(self.logs, self.persona_pool, topic=self.current_topic, topic_trigger=self.current_topic_trigger, num_speakers=1, speaker_aggressiveness=self.speaker_aggressiveness)
+            replies = human_reply(
+                self.logs,
+                self.persona_pool,
+                topic=self.current_topic,
+                topic_trigger=self.current_topic_trigger,
+                num_speakers=1,
+                speaker_aggressiveness=self.speaker_aggressiveness,
+                emotional_needs=self.persona_emotional_needs
+            )
             if replies:
                 # 安定時に生成された発話を self.logs に追加（実環境の会話履歴として保存）
                 self.logs.extend(replies)
@@ -642,7 +685,6 @@ class ConversationEnv:
             # 終了条件
             # 1. max_auto_skip回試して不安定にならなかった場合
             # 2. max_stepsに達した場合
-            # 3. skip_stableが有効で安定状態が続く場合（filter_zero_rewardsの意図）
             if reached_max_auto_skip:
                 done = True
                 if self.debug:
@@ -651,11 +693,6 @@ class ConversationEnv:
                 done = True
                 if self.debug:
                     print(f"  max_stepsに達したためエピソード終了 (t={self.t}, max_steps={self.max_steps})")
-            elif skip_stable and max_auto_skip > 0:
-                # filter_zero_rewardsが有効な場合、安定状態で報酬0のサンプルを避けるため終了
-                done = True
-                if self.debug:
-                    print(f"  [filter_zero_rewards] 安定状態のためエピソード終了（報酬0をスキップ）")
             else:
                 done = False
 
@@ -726,11 +763,18 @@ class ConversationEnv:
                 trace_metrics = []
                 if self.debug:
                     print(f"  [auto_skip] ループ内で評価した関係性を使用（再評価なし）")
+                    print(f"    unstable_triads: {metrics.get('unstable_triads', 0)}")
+                    print(f"    auto_skip_count: {auto_skip_count}")
             else:
                 # ループが実行されなかった場合のみ新規評価
+                if self.debug:
+                    print(f"  [auto_skip] final_rel_metrics=None → 新規評価を実行")
+                    print(f"    auto_skip_count: {auto_skip_count}")
                 filtered_logs = filter_logs_by_human_count(self.logs, self.max_history_relation, exclude_robot=True)
                 rel, trace_scores = self._relation_state(filtered_logs, update_state=True)
                 metrics, trace_metrics = self._metrics_state(rel, participants)
+                if self.debug:
+                    print(f"    新規評価結果: unstable_triads={metrics.get('unstable_triads', 0)}")
 
             is_stable = metrics.get("unstable_triads", 0) == 0 and bool(self.logs)
 
@@ -810,20 +854,25 @@ class ConversationEnv:
 
         # 介入判定
         robot_entry: Optional[Dict[str, Any]] = None
-        intervened = False
+        robot_actually_spoke = False  # ロボットが実際に発話したかどうか
+        
         if plan and plan.get("intervene_now"):
             if self.debug:
                 print(f"  🤖 ロボット介入を実行")
             robot_entry = self._render_intervention(plan, simulate=False)
-            intervened = True
+            robot_actually_spoke = True
             if self.debug:
                 print(f"    発話内容: {robot_entry.get('utterance', '')[:80]}...")
         elif direct_utterance:
             robot_entry = {"speaker": "ロボット", "utterance": _strip_quotes(direct_utterance)}
-            intervened = True
+            robot_actually_spoke = True
         else:
             if self.debug:
-                print(f"  ⏭️  介入しない選択")
+                print(f"  ⏭️  介入しない選択 (no_intervention)")
+        
+        # 介入判断をした場合は常にTrue（no_interventionも含む）
+        # これにより次のステップで人間発話生成をスキップし、evaluation_horizon後の状態を評価
+        intervened = True  # 介入判断を実行したことを記録
 
         # 報酬の初期化
         reward = 0.0
@@ -834,9 +883,11 @@ class ConversationEnv:
         target_speaker = plan.get("target_speaker", "A") if plan else "A"
         strategy = plan.get("strategy", "plan") if plan else "plan"
 
-        # ロボット発話を追加（介入する場合のみ）
-        if intervened:
+        # ロボット発話を追加（実際に発話した場合のみ）
+        if robot_actually_spoke and robot_entry:
             self.logs.append(robot_entry)
+            if self.debug:
+                print(f"  📝 ロボット発話をログに追加")
 
         # evaluation_horizon回の人間発話を生成
         if self.debug:
@@ -858,7 +909,8 @@ class ConversationEnv:
         self._bootstrap_humans(
             self.evaluation_horizon,
             emotional_needs=emotional_needs,
-            is_correct_strategy_flags=is_correct_strategy_flags
+            is_correct_strategy_flags=is_correct_strategy_flags,
+            target_speaker=target_speaker
         )
 
         # evaluation_horizon後の関係性を評価
@@ -890,23 +942,33 @@ class ConversationEnv:
         if self.debug:
             print(f"  📊 evaluation_horizon後の関係性:")
             print(f"    安定状態: {is_stable_after}")
+            print(f"    全エッジスコア: {metrics_after.get('edges', {})}")
             print(f"    対象エッジ（{edge_to_change}）スコア: {target_edge_score_after:.4f}")
             print(f"    対象エッジが正: {target_edge_positive_after}")
 
-        # 報酬計算: stable_bonus + preference_match_bonus
+        # 報酬計算: 2段階のbonus (horizon + terminal) + preference_match_bonus
         rel_after_bonus = None  # terminal_bonus_duration後の関係性を保存する変数
 
-        # stable_bonus付与条件: 対象エッジが正 AND 全体が安定
-        if is_stable_after and target_edge_positive_after:
+        # 正解戦略かどうかを先に判定（bonus付与条件で使用）
+        preferred_strategy = self._get_human_preferred_strategy(target_speaker)
+        is_correct_strategy = (strategy == preferred_strategy)
+
+        # 第1段階: evaluation_horizon後に安定+ターゲットエッジ+で正解戦略 → horizon_bonus
+        if is_stable_after and target_edge_positive_after and is_correct_strategy:
+            reward += self.horizon_bonus
+            reward_breakdown["horizon_bonus"] = self.horizon_bonus
             if self.debug:
-                print(f"  🎯 安定達成 & 対象エッジ正 → terminal_bonusチェック開始")
+                print(f"  🎁 evaluation_horizon後: 安定 & 対象エッジ正 & 正解戦略 → horizon_bonus付与: +{self.horizon_bonus:.4f}")
                 print(f"    追加で{self.terminal_bonus_duration}人間発話分の安定性を確認")
         elif self.debug:
             if not is_stable_after:
-                print(f"  ⚠️  全体が不安定 → stable_bonusなし")
+                print(f"  ⚠️  evaluation_horizon後: 全体が不安定 → horizon_bonusなし")
             elif not target_edge_positive_after:
-                print(f"  ⚠️  対象エッジ（{edge_to_change}）が正でない（{target_edge_score_after:.4f}） → stable_bonusなし")
+                print(f"  ⚠️  evaluation_horizon後: 対象エッジ（{edge_to_change}）が正でない（{target_edge_score_after:.4f}） → horizon_bonusなし")
+            elif not is_correct_strategy:
+                print(f"  ⚠️  evaluation_horizon後: 不正解戦略（{strategy} ≠ {preferred_strategy}） → horizon_bonusなし")
 
+        # 第2段階: terminal_bonus_duration発話を生成して、さらに安定性をチェック
         if is_stable_after and target_edge_positive_after:
 
             # terminal_bonus_duration人間発話を生成（実際には1ラウンド = 3人間発話が最小単位）
@@ -914,7 +976,8 @@ class ConversationEnv:
             self._bootstrap_humans(
                 self.terminal_bonus_duration,
                 emotional_needs=emotional_needs,
-                is_correct_strategy_flags=is_correct_strategy_flags
+                is_correct_strategy_flags=is_correct_strategy_flags,
+                target_speaker=target_speaker
             )
 
             # 最後の関係性を再評価
@@ -923,6 +986,8 @@ class ConversationEnv:
 
             stability_maintained = True
             target_edge_positive_check = False
+            metrics_check = None  # terminal後の関係性（JSONLに出力するため）
+
             if human_count_check >= self.start_relation_check_after_utterances:
                 filtered_check = filter_logs_by_human_count(self.logs, self.max_history_relation, exclude_robot=True)
                 rel_check, _ = self._relation_state(filtered_check, update_state=True)
@@ -946,23 +1011,24 @@ class ConversationEnv:
                     if self.debug:
                         print(f"    ✅ 安定維持 & 対象エッジ正（{target_edge_score_check:.4f}）")
 
-            # terminal_bonus_duration人間発話後も安定が続き、対象エッジも正の場合
-            if stability_maintained and target_edge_positive_check:
+            # terminal_bonus_duration後の関係性を保存（JSONLに出力するため）
+            rel_after_bonus = metrics_check
+
+            # terminal_bonus_duration人間発話後も安定が続き、対象エッジも正、かつ正解戦略の場合 → terminal_bonus
+            if stability_maintained and target_edge_positive_check and is_correct_strategy:
                 if self.debug:
-                    print(f"  🎁 安定が持続 & 対象エッジ正 → stable_bonus付与: +{self.stable_bonus:.4f}")
-                reward += self.stable_bonus
-                reward_breakdown["stable_bonus"] = self.stable_bonus
-                # terminal_bonus_duration後の関係性を保存（後でinfoに追加）
-                rel_after_bonus = metrics_check
+                    print(f"  🎁 terminal_bonus_duration後: 安定持続 & 対象エッジ正 & 正解戦略 → terminal_bonus付与: +{self.terminal_bonus_reward:.4f}")
+                reward += self.terminal_bonus_reward
+                reward_breakdown["terminal_bonus"] = self.terminal_bonus_reward
             elif self.debug:
                 if not stability_maintained:
-                    print(f"  ⚠️  安定が持続せず → stable_bonusなし")
+                    print(f"  ⚠️  terminal_bonus_duration後: 安定が持続せず → terminal_bonusなし")
                 elif not target_edge_positive_check:
-                    print(f"  ⚠️  対象エッジが正でない → stable_bonusなし")
+                    print(f"  ⚠️  terminal_bonus_duration後: 対象エッジが正でない → terminal_bonusなし")
+                elif not is_correct_strategy:
+                    print(f"  ⚠️  terminal_bonus_duration後: 不正解戦略（{strategy} ≠ {preferred_strategy}） → terminal_bonusなし")
 
         # 正解戦略の場合、preference_match_bonusを付与
-        preferred_strategy = self._get_human_preferred_strategy(target_speaker)
-        is_correct_strategy = (strategy == preferred_strategy)
         if is_correct_strategy:
             reward += self.preference_match_bonus
             reward_breakdown["preference_match_bonus"] = self.preference_match_bonus
@@ -1012,7 +1078,8 @@ class ConversationEnv:
         info: Dict[str, Any] = {
             "plan": plan,
             "plan_error": plan_error,
-            "intervened": intervened,
+            "intervened": intervened,  # 介入判断を実行したか（no_interventionも含む）
+            "robot_actually_spoke": robot_actually_spoke,  # ロボットが実際に発話したか
             "balanced": final_balanced,
             "robot_utterance": robot_entry["utterance"] if robot_entry else None,
             "replies": [entry for entry in self.logs[len(snapshot_logs):]],
@@ -1055,14 +1122,29 @@ class ConversationEnv:
             print(f"  is_stable: {unstable_count_before == 0}")
             print(f"  edges: {rel_before_metrics.get('edges', {})}")
 
-        # 介入した場合、evaluation_horizon後の関係性を追加
-        if intervened:
-            info["rel_after_horizon"] = metrics_after
-            info["stable_after_horizon"] = is_stable_after
+        # evaluation_horizon後の関係性を追加（no_interventionでも出力）
+        info["rel_after_horizon"] = metrics_after
+        info["stable_after_horizon"] = is_stable_after
+        info["target_edge_score_after_horizon"] = target_edge_score_after
+        info["target_edge_positive_after_horizon"] = target_edge_positive_after
 
-            # terminal_bonus_duration後の関係性を追加（該当する場合）
-            if rel_after_bonus is not None:
-                info["rel_after_bonus"] = rel_after_bonus
+        # terminal_bonus_duration後の関係性を追加（該当する場合）
+        if rel_after_bonus is not None:
+            info["rel_after_terminal"] = rel_after_bonus
+            # terminal後の安定性とターゲットエッジ状態も追加
+            unstable_triads_terminal = rel_after_bonus.get("unstable_triads", 0)
+            info["stable_after_terminal"] = (unstable_triads_terminal == 0)
+
+            # terminal後の対象エッジスコアを取得
+            edges_terminal = rel_after_bonus.get("edges", {})
+            target_edge_score_terminal = edges_terminal.get(edge_to_change, 0.0)
+            # 逆向きも試す（"AB" vs "BA"）
+            if target_edge_score_terminal == 0.0 and len(edge_to_change) >= 2:
+                reverse_edge = edge_to_change[1] + edge_to_change[0]
+                target_edge_score_terminal = edges_terminal.get(reverse_edge, 0.0)
+
+            info["target_edge_score_after_terminal"] = target_edge_score_terminal
+            info["target_edge_positive_after_terminal"] = (target_edge_score_terminal > 0)
 
         # 報酬の内訳が空の場合は注記を追加（安定で報酬計算がスキップされた等の理由）
         if not reward_breakdown:
@@ -1188,32 +1270,43 @@ class ConversationEnv:
 
     def _make_observation(self) -> str:
         context = self.planning_context()
-        # intervention_max_history個の人間発話 + その間のロボット発話を取得（介入判定用）
-        filtered_logs = filter_logs_by_human_count(self.logs, self.intervention_max_history)
-        history_lines = [f"[{item.get('speaker', '?')}] {item.get('utterance', '').strip()}" for item in filtered_logs]
-        if not history_lines:
-            history_lines = ["(履歴なし)"]
 
         scores = context.get("scores", {}) or {"AB": 0.0, "BC": 0.0, "CA": 0.0}
-        
+
         # 改善すべきエッジとターゲット話者を特定（共通関数を使用）
-        # ※重要: ターゲット話者はここで1回だけランダムに選択し、
+        # ※重要: ターゲット話者は1ターンで1回だけランダムに選択し、
         #   後続の_parse_planで再利用する（2回選択すると不整合が生じるため）
+        # 同じターンで既に選択済みの場合は再利用する
         # relation_snapshot()から取得したエッジ情報を使用
         rel = self.relation_snapshot()
         if isinstance(rel, dict):
             metrics = rel.get("metrics", rel)
             edges = metrics.get("edges", {})
             if edges:
-                target_edge, target_speaker = select_target_edge_and_speaker(
-                    edges, 
-                    debug=False,  # observation生成時はデバッグ出力不要
-                    debug_prefix=""
-                )
-                # 選択したターゲット話者を保存（_parse_planで再利用）
-                self._current_target_edge = target_edge
-                self._current_target_speaker = target_speaker
+                # 同じターンで既に選択済みかチェック
+                current_turn = getattr(self, 't', 0)
+                last_selection_turn = getattr(self, '_last_target_selection_turn', -1)
                 
+                if current_turn == last_selection_turn and hasattr(self, '_current_target_edge') and hasattr(self, '_current_target_speaker'):
+                    # 既に選択済みなので再利用
+                    target_edge = self._current_target_edge
+                    target_speaker = self._current_target_speaker
+                    if self.debug:
+                        print(f"  [_make_observation] ターゲット再利用: {target_edge}, {target_speaker}")
+                else:
+                    # 新しいターンまたは初回選択
+                    target_edge, target_speaker = select_target_edge_and_speaker(
+                        edges,
+                        debug=False,  # observation生成時はデバッグ出力不要
+                        debug_prefix=""
+                    )
+                    # 選択したターゲット話者とターン番号を保存
+                    self._current_target_edge = target_edge
+                    self._current_target_speaker = target_speaker
+                    self._last_target_selection_turn = current_turn
+                    if self.debug:
+                        print(f"  [_make_observation] ターゲット新規選択 (turn={current_turn}): {target_edge}, {target_speaker}")
+
                 # エッジのスコアを取得
                 # edgesのキーはタプルの可能性があるので、両方の形式を試す
                 target_score = None
@@ -1225,7 +1318,7 @@ class ConversationEnv:
                     if edge_str == target_edge or edge_str == target_edge[::-1]:
                         target_score = score
                         break
-                
+
                 if target_score is None:
                     target_score = 0.0
             else:
@@ -1241,16 +1334,28 @@ class ConversationEnv:
             self._current_target_edge = target_edge
             self._current_target_speaker = target_speaker
 
+        # 対象話者の発言のみを抽出（介入判定用）
+        # intervention_max_history個の人間発話から、target_speakerの発言のみをフィルタ
+        filtered_logs = filter_logs_by_human_count(self.logs, self.intervention_max_history)
+        target_speaker_logs = [
+            item for item in filtered_logs
+            if item.get('speaker') == target_speaker
+        ]
+        history_lines = [f"[{item.get('speaker', '?')}] {item.get('utterance', '').strip()}" for item in target_speaker_logs]
+        if not history_lines:
+            history_lines = ["(履歴なし)"]
+
         # プロンプト最適化: 可変要素（会話履歴、関係スコア、改善対象）を返す
         # 固定説明（タスク、制約、戦略）はシステムプロンプトに移動済み（build_robot_messages参照）
         prompt_lines = [
-            "履歴:",
+            f"=== ターゲット話者（{target_speaker}）の発話履歴 ===",
             *history_lines,
-            "",
-            "現在の関係スコア（-1..1）: " + ", ".join(f"w_{edge}={value:+.2f}" for edge, value in scores.items()),
-            "",
-            f"改善すべきエッジ: {target_edge} (現在: {target_score:+.2f})",
-            f"発話対象（ターゲット）: {target_speaker}",
+            "=== 現在の関係スコア（-1〜1） ===",
+            ", ".join(f"w_{edge}={value:+.2f}" for edge, value in scores.items()),
+            f"=== 改善対象エッジ ===",
+            f"{target_edge}（現在: {target_score:+.2f}）",
+            f"=== 介入対象（ターゲット） ===",
+            f"{target_speaker}",
         ]
         return "\n".join(prompt_lines)
 
@@ -1301,6 +1406,7 @@ class ConversationEnv:
 
             if strategy == "no_intervention":
                 plan["intervene_now"] = False
+                plan["strategy"] = "no_intervention"
                 # 介入なしの場合でもedge_to_changeとtarget_speakerを記録（ログ出力用）
                 plan["edge_to_change"] = edge_to_change
                 plan["target_speaker"] = target_speaker
@@ -1361,20 +1467,9 @@ class ConversationEnv:
 
         strategy = plan.get("strategy")
 
-        # no_interventionの場合は「見守り」発話
+        # no_interventionの場合は発話しない（Noneを返す）
         if strategy == "no_intervention":
-            import random
-            utterances = [
-                "（静かに聞いています）",
-                "（うなずいて見守っています）",
-                "（話を聞いています）",
-                "（黙って耳を傾けています）"
-            ]
-            utterance = random.choice(utterances)
-            return {
-                "speaker": "ロボット",
-                "utterance": utterance
-            }
+            return None
 
         # robot_max_history個の人間発話 + その間のロボット発話を取得（ロボット発話生成用）
         filtered_logs = filter_logs_by_human_count(self.logs, self.robot_max_history)
@@ -1459,7 +1554,8 @@ class ConversationEnv:
         self,
         target_turns: int,
         emotional_needs: Optional[Dict[str, str]] = None,
-        is_correct_strategy_flags: Optional[Dict[str, bool]] = None
+        is_correct_strategy_flags: Optional[Dict[str, bool]] = None,
+        target_speaker: Optional[str] = None
     ) -> None:
         # 人間参加者の発話を追加して会話を進める
         turns_added = 0
@@ -1474,7 +1570,8 @@ class ConversationEnv:
                 num_speakers=1,
                 speaker_aggressiveness=self.speaker_aggressiveness,
                 emotional_needs=emotional_needs,
-                is_correct_strategy_flags=is_correct_strategy_flags
+                is_correct_strategy_flags=is_correct_strategy_flags,
+                target_speaker=target_speaker
             )
             if not replies:
                 break
@@ -1545,7 +1642,10 @@ class ConversationEnv:
         # 初期状態が不安定になるまで人間発話を追加する
         attempts = 0
         while self._is_balanced() and attempts < self.max_steps:
-            self._bootstrap_humans(self.evaluation_horizon)
+            self._bootstrap_humans(
+                self.evaluation_horizon,
+                emotional_needs=self.persona_emotional_needs
+            )
             attempts += 1
 
     def _participants(self, logs: List[Dict[str, Any]]) -> List[str]:

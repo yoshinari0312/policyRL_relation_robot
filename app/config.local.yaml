@@ -103,14 +103,15 @@ env:
   evaluation_horizon: 3  # ロボットの何発話後の関係性を報酬に使うか
   max_auto_skip: 10  # 安定状態が何回続いたら話題転換するか
 
-  # === 報酬パラメータ（新構造：感情ニーズベース） ===
-  stable_bonus: 2.0  # 安定達成時のボーナス（evaluation_horizon + terminal_bonus_duration後も安定が維持された場合）
+  # === 報酬パラメータ（新構造：感情ニーズベース + 2段階ボーナス） ===
+  horizon_bonus: 1.0  # evaluation_horizon後に安定+ターゲットエッジ+正解戦略で付与
+  terminal_bonus: 1.0  # terminal_bonus_duration後も安定+ターゲットエッジ+正解戦略で付与（追加）
   preference_match_bonus: 0.5  # 人間の好み（感情ニーズ）に一致した戦略選択時のボーナス
-  terminal_bonus_duration: 2  # 安定が続く必要がある発話数（evaluation_horizon後にさらにチェック）
+  terminal_bonus_duration: 3  # horizon_bonus後、さらに安定が続く必要がある発話数
 
   # === 旧報酬パラメータ（互換性のため維持） ===
+  stable_bonus: 2.0  # 旧パラメータ（horizon_bonus + terminal_bonusに置き換え）
   time_penalty: 0.1  # 毎ステップのペナルティ（現在は未使用）
-  terminal_bonus: 2.0  # 安定達成時のボーナス（stable_bonusに置き換え）
   intervention_cost: 0.35  # ロボット介入時のコスト（現在は未使用）
   output_error_penalty: 1.0  # LLM出力失敗時のペナルティ
   min_robot_intervention_lookback: 6  # 安定ボーナスのための介入確認範囲（現在は未使用）
@@ -193,7 +194,7 @@ ppo:
   lora_rank: 16  # LoRAのランク
   
   # === 学習率 ===
-  lr: 5.0e-5  # 学習率を下げてKL爆発を防ぐ（2e-5 → 1e-5）
+  lr: 1.0e-4  # 学習率を上げて推定精度向上を加速（5e-5 → 1e-4）
   lr_scheduler_type: "cosine"  # 学習率スケジューラー ("constant", "linear", "cosine", "polynomial")
   warmup_ratio: 0.01  # ウォームアップ期間（総ステップ数の1%）
   # min_lr_ratio: 0.25  # 終了時の学習率（cosineスケジューラーのデフォルトは0）
@@ -201,48 +202,57 @@ ppo:
   # === バッチサイズ ===
   per_device_train_batch_size: 4  # 1デバイスあたりのバッチサイズ
   per_device_eval_batch_size: 4  # 評価時の1デバイスあたりのバッチサイズ
-  ppo_epochs: 3  # ppoのエポック数（過学習防止のため4→3に削減）
+  ppo_epochs: 2  # ppoのエポック数（過学習防止のため4→3に削減）
   grad_accum_steps: 4  # 勾配累積ステップ数（実効バッチサイズ = per_device_train_batch_size × grad_accum_steps × 2)）
   num_mini_batches: 2  # ミニバッチ数を増やして更新を細かく（1 → 4、安定化）
 
   # === LLMの多様性 ===
   max_new_tokens: 2  # 生成する最大トークン数
-  temperature: 0.7  # Qwen3では0.7が推奨
+  temperature: 0.6
   top_p: 0.9  # Qwen3では0.8が推奨
   decode_typical_p: 0.90  # typical samplingも調整（0.95 → 0.90）
   
-  # === エントロピー正則化（探索促進の要） ===
-  # entropy_coef: エントロピーボーナスの重み
-  # - 目的: 多様な戦略の探索を促進（bridge/plan/validateの偏りを防ぐ）
-  # - 範囲: 0.01～0.1が一般的
-  #   * 0.01: 控えめ（安定重視、探索は限定的）
-  #   * 0.05: 中程度（バランス型） ← 現在の設定
-  #   * 0.1: 積極的（最大探索、学習不安定化リスク）
-  # - 判断基準:
-  #   * entropy_avg < 0.3 → 係数を0.1に増やす（探索不足）
-  #   * 0.3 ≤ entropy_avg < 0.5 → 係数を0.07に増やす（やや探索不足）
-  #   * 0.5 ≤ entropy_avg < 1.0 → 現状維持（適切）
-  #   * entropy_avg ≥ 1.0 → 係数を0.03に減らす（過剰探索）
-  #   * KL divergence > 0.3 → 係数を減らす（学習不安定）
-  # - policy_loss への影響: 通常 policy_loss は 0.01～0.1 程度
-  #   → entropy_coef=0.05, entropy_avg=0.5 なら bonus=-0.025
-  #   → policy_loss の 25～250% 相当の調整力（適切な範囲）
+  # === エントロピー正則化（学習中の探索促進） ===
+  # 【戦略】temperature低 + フェーズ別自動調整
+  # - 学習初期: 高い目標エントロピー → 多様な戦略を試す（探索）
+  # - 学習中期: 中程度の目標 → 有望な戦略を深掘り（バランス）
+  # - 学習後期: 低い目標 → 確信度の高い選択に収束（活用）
+  # - 推論時: 低temperature → 学習済みの確信をそのまま使う
+  # → 結果: 「状況に応じて適切に多様」だが「同じ状況では確信的」
 
-  # === エントロピー係数の自動制御 ===
-  # α ← α * exp(β*(H_target - H_observed)) で更新
-  entropy_auto_adjust: true  # エントロピー係数の自動調整を有効化
-  entropy_target: 0.5  # 目標エントロピー
-  entropy_adjust_beta: 0.3  # 調整の強さ（β）0.1 → 0.3
-  entropy_coef_initial: 0.05  # エントロピー係数の初期値
-  entropy_coef_min: 0.001  # エントロピー係数の最小値
-  entropy_coef_max: 0.3  # エントロピー係数の最大値
+  # === フェーズ別自動調整方式（推奨） ===
+  entropy_auto_adjust: true  # 自動調整を有効化
+  entropy_coef_initial: 0.1  # エントロピー係数の初期値
+  entropy_coef_min: 0.01  # 係数の最小値（低すぎる探索を防ぐ）
+  entropy_coef_max: 0.3  # 係数の最大値（過剰探索を防ぐ）
+  entropy_adjust_beta: 0.3  # 調整の強さ（0.05 → 0.1: より積極的に調整）
+  
+  # フェーズ切り替えタイミング
+  entropy_transition_updates: [0.3, 0.6]  # 30%, 60%でフェーズ切り替え
+  
+  # フェーズ1（初期0-30%）: 高い探索
+  entropy_target_phase1: 0.7  # 高い目標 → 全戦略を均等に試す
+  # H_observed < 0.7 なら係数を上げて探索を促進
+  # H_observed > 0.7 なら係数を下げて過剰探索を抑制
+  
+  # フェーズ2（中期30-60%）: バランス
+  entropy_target_phase2: 0.4  # 中程度の目標 → 有望な戦略に注目
+  # 探索と活用のバランスを取る
+  
+  # フェーズ3（後期60-100%）: 収束
+  entropy_target_phase3: 0.2  # 低い目標 → 確信的な選択に収束
+  # 学習した最適戦略に集中
+  
+  max_entropy_bonus: 0.5  # エントロピーボーナスの上限クリップ
 
-  # 以下は従来のフェーズ方式（entropy_auto_adjust=falseの場合に使用）
-  entropy_coef_phase1: 0.05  # エントロピーボーナスの重み（フェーズ1: 探索促進強化）
-  entropy_coef_phase2: 0.05  # エントロピーボーナスの重み（フェーズ2: 探索促進中程度）
-  entropy_coef_phase3: 0.05  # エントロピーボーナスの重み（フェーズ3: 探索促進控えめ）
-  entropy_transition_updates: [0.1, 0.3]  # エントロピー係数の変更タイミング（total_updatesの割合: 10%, 30%）
-  max_entropy_bonus: 0.5  # エントロピーボーナスの上限クリップ（0.5まで）
+  # === 従来のフェーズ方式（entropy_auto_adjust=falseの場合に使用） ===
+  # 固定係数モード（自動調整なし）
+  entropy_coef_phase1: 0.05  # フェーズ1の固定係数
+  entropy_coef_phase2: 0.03  # フェーズ2の固定係数
+  entropy_coef_phase3: 0.01  # フェーズ3の固定係数
+  
+  # === 単一目標方式（後方互換性のため維持） ===
+  entropy_target: 0.7  # 全フェーズ共通の目標（phase別設定がない場合のデフォルト）
 
 
   # === KL制約の緩和（探索促進） ===
@@ -271,7 +281,7 @@ ppo:
 
   # === 価値関数とアドバンテージ ===
   vf_coef: 0.1  # 価値関数損失の係数を下げる（0.1 → 0.05、過学習防止）
-  gamma: 0.9  # 割引率（1.0=割引なし、エピソード内の全報酬を等しく評価）
+  gamma: 0.8  # 割引率（1.0=割引なし、エピソード内の全報酬を等しく評価）
   lam: 0.95  # GAE lambda（0.95が標準、高いほど長期的報酬を重視）
 
   # === エントロピー監視 ===
@@ -279,9 +289,9 @@ ppo:
   entropy_patience: 20  # エントロピーが閾値を下回る連続回数を増やす（10 → 20、早期停止を抑制）
   entropy_monitor_warmup: 2  # ウォームアップ期間を短縮（20 → 5、早期に監視開始）
   
-  total_updates: 50  # 総更新回数（学習時間と性能のバランスを調整）
+  total_updates: 15  # 総更新回数（学習時間と性能のバランスを調整）
   output_dir: "../models/ppo_robot"  # ppoモデルの保存先ディレクトリ
-  enable_deterministic_eval: true  # 決定的評価を有効化
+  enable_deterministic_eval: false  # 決定的評価を有効化
   deterministic_eval_frequency: 3  # 何ステップごとに評価するか
   max_memory_per_device_gib: 44  # GPUごとの最大使用量 (GiB, 49GiB GPUから余裕を持って使用)
   cuda_visible_devices: "0,1,2,3,4,5"  # 全GPU（0-5）を使用

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-GPT-5による戦略推定テスト
+戦略推定精度テスト（GPT-5 & ローカルLLM対応）
 
-各ペルソナに「隠れた感情ニーズ」を設定し、GPT-5が会話から適切な介入戦略を推定できるかをテストします。
-（ニーズ推定は行わず、会話から直接戦略を推定します）
+各ペルソナに「隠れた感情ニーズ」を設定し、モデルが会話から適切な介入戦略を推定できるかをテストします。
+- GPT-5（Azure OpenAI）
+- ローカルLLM（学習前モデル）
 """
 
 from __future__ import annotations
@@ -17,6 +18,9 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # .envファイルを読み込む
 try:
@@ -199,12 +203,12 @@ def _generate_human_utterance_with_need(
 
     lines.append("会話の開始時点では、他の参加者がまだ発言していない場合もあります。その場合は話題に沿って発言してください\n")
 
-    # 隠れた感情ニーズ（表には出さない）
+    # 性格ニーズの説明
     need_descriptions_internal = {
-        "recognition": "あなたは内心、自分の意見や感情を認めてほしいと思っています。相手が共感・承認してくれると嬉しく感じます。",
-        "mediation": "あなたは内心、仲裁を求めており、誰かに仲を取り持ってほしいと思っています。",
-        "solution": "あなたは内心、具体的な解決策がほしいと思っています。抽象的な話よりも、実践的なアプローチを求めています。",
-        "independence": "あなたは内心、他人に介入されず、放っておいてほしいと思っています。自分のペースで、自分の力で問題を解決したいと考えています。"
+        "recognition": "あなたは自分の意見や感情を認めてほしいと思うタイプです。相手が共感・承認してくれると嬉しく感じます。会話でもそのように振る舞います。",
+        "mediation": "あなたは仲裁を求めており、誰かに仲を取り持ってほしいと思うタイプです。対立が和らぎ、調和が生まれることを望んでいます。会話でもそのように振る舞います。",
+        "solution": "あなたは具体的な解決策を求めており、問題に対して明確な道筋やアドバイスがほしいと考えています。会話でもそのように振る舞います。",
+        "independence": "あなたは自分で解決したいタイプで、放っておいてほしいと感じています。自分のペースで進めることを好みます。会話でもそのように振る舞います。"
     }
     lines.append(f"\n{need_descriptions_internal[emotional_need]}\n")
 
@@ -376,21 +380,29 @@ def select_strategy_from_conversation(
     target_edge, target_speaker = _select_target_edge_and_speaker(scores, debug)
     target_score = scores[target_edge]
 
-    # 会話履歴をフォーマット
-    history_lines = [f"[{log['speaker']}] {log['utterance']}" for log in conversation]
+    # 対象話者の発話のみをフィルタ（学習環境と同じ）
+    target_speaker_utterances = [
+        f"[{log['speaker']}] {log['utterance']}"
+        for log in conversation
+        if log['speaker'] == target_speaker
+    ]
+
+    if not target_speaker_utterances:
+        target_speaker_utterances = ["(対象話者の発話なし)"]
 
     system_content = """
-あなたは、会話が不安定になっているときに、ロボットがどのように介入すれば関係を安定化できるかを判断し、数字1桁を出力するアシスタントです。
+あなたは、人間がどのような介入を求めているか、または介入を求めていないかを高精度で推定できる高度なAIアシスタントです。
 会話は三者（A, B, C）の間で行われており、一時的な対立や不調和が生じています。
 
 【目的】
-ターゲットとなる人物を中心に、その人物が含まれる関係（エッジ）を安定（+方向）に導くために、
-最も効果的な介入戦略を1つ選択してください。
+ターゲット話者の発話内容と関係スコアをもとに、その人が今最も求めている心理的ニーズを推定し、関係を安定化させるために最適な選択を1つ選択してください。
+
+**重要**: ターゲットが自分で解決したいと感じている場合や、介入を望んでいない兆候がある場合は、no_interventionを選択することが最適です。人によっては干渉されることを嫌う場合があり、その場合は介入しない方が良好な関係を保てます。
 
 ---
 
 【入力情報】
-- 会話履歴（A, B, Cの発話）
+- ターゲット話者の発話履歴（その人の発言のみ）
 - 各ペアの関係スコア（-1〜1）
 - 介入対象者（ターゲット）
 - 改善すべき関係ペア（エッジ）
@@ -398,20 +410,20 @@ def select_strategy_from_conversation(
 ---
 
 【選択肢】
-1. validate — 感情や意見を承認し、心理的安全性を高める。
-2. bridge — 対立している相手との共通点や協力軸を見つけ、調和を促す。
-3. plan — 具体的な行動方針を提案し、関係修復を前進させる。
-4. no_intervention — 軽度な不調和で自然回復が見込まれる場合、または介入が逆効果となる場合。
+1. validate — 感情や意見を承認し、心理的安全性を高める。ターゲットが共感や承認を求めている場合に有効。
+2. bridge — 対立している相手との共通点や協力軸を見つけ、調和を促す。ターゲットが仲裁を求めている場合に有効。
+3. plan — 具体的な行動方針を提案し、関係修復を前進させる。ターゲットが解決策を求めている場合に有効。
+4. no_intervention — ターゲットは自分で解決したい、または介入を望んでいない。放っておいてほしいと感じている場合に有効。
 
 ---
 
 【判断基準】
-会話内容から、ターゲットが今求めている心理的ニーズを推定し、関係を安定化させるために最適な戦略を選択してください。
+ターゲット話者の発話内容から、その人が今求めている心理的ニーズを推定してください。
 
-- 承認や共感を求めている場合 → 1 (validate)
-- 仲裁や協調を求めている場合 → 2 (bridge)
-- 具体的な行動や方向性を求めている場合 → 3 (plan)
-- 自立的に進めたい、干渉を避けたい場合 → 4 (no_intervention)
+- 承認や共感を求めている発言が多い → 1 (validate)
+- 仲裁や協調を求めている発言が多い → 2 (bridge)
+- 具体的な解決策や行動計画を求めている発言が多い → 3 (plan)
+- 自分で解決したい、放っておいてほしいという態度が見られる → 4 (no_intervention)
 
 ---
 
@@ -420,16 +432,16 @@ def select_strategy_from_conversation(
 - 理由・説明・補足は出力しない。
 """
 
-    # 学習環境のプロンプト + 性格判断のヒント
+    # ターゲット話者の発話のみを含むプロンプト
     prompt_lines = [
-        "=== 会話履歴 ===",
-        *history_lines,
-        "",
+        f"=== ターゲット話者（{target_speaker}）の発話履歴 ===",
+        *target_speaker_utterances,
         "=== 現在の関係スコア（-1〜1） ===",
         ", ".join(f"w_{edge}={value:+.2f}" for edge, value in scores.items()),
-        "",
-        f"=== 改善対象エッジ === {target_edge}（現在: {target_score:+.2f}）",
-        f"=== 介入対象（ターゲット） === {target_speaker}",
+        f"=== 改善対象エッジ ===",
+        f"{target_edge}（現在: {target_score:+.2f}）",
+        f"=== 介入対象（ターゲット） ===",
+        f" {target_speaker}",
     ]
     user_content = "\n".join(prompt_lines)
 
@@ -450,7 +462,7 @@ def select_strategy_from_conversation(
                 {"role": "system", "content": system_content},
                 {"role": "user", "content": user_content}
             ]
-            params = build_chat_completion_params(deployment, messages, cfg.llm, temperature=0.3)
+            params = build_chat_completion_params(deployment, messages, cfg.llm, temperature=0)
             res = client.chat.completions.create(**params)
 
             if res and getattr(res, "choices", None):
@@ -486,16 +498,186 @@ def select_strategy_from_conversation(
     return strategy_map[strategy_num], target_edge, target_speaker, scores
 
 
+def select_strategy_with_local_llm(
+    conversation: List[Dict[str, str]],
+    cfg,
+    local_model,
+    local_tokenizer,
+    debug: bool = False
+) -> Tuple[str, str, str, Dict[str, float]]:
+    """
+    学習前のローカルLLMで介入戦略を選択させる
+
+    Returns:
+        (strategy, target_edge, target_speaker, scores)
+    """
+    # 関係性スコアを計算
+    scores = _calculate_relation_scores(conversation, cfg, debug)
+
+    # 対象エッジと話者を選択
+    target_edge, target_speaker = _select_target_edge_and_speaker(scores, debug)
+    target_score = scores[target_edge]
+
+    # 対象話者の発話のみをフィルタ
+    target_speaker_utterances = [
+        f"[{log['speaker']}] {log['utterance']}"
+        for log in conversation
+        if log['speaker'] == target_speaker
+    ]
+
+    if not target_speaker_utterances:
+        target_speaker_utterances = ["(対象話者の発話なし)"]
+
+    # select_strategy_from_conversationと同じプロンプトを使用
+    system_content = """
+あなたは、人間がどのような介入を求めているか、または介入を求めていないかを高精度で推定できる高度なAIアシスタントです。
+会話は三者（A, B, C）の間で行われており、一時的な対立や不調和が生じています。
+
+【目的】
+ターゲット話者の発話内容と関係スコアをもとに、その人が今最も求めている心理的ニーズを推定し、関係を安定化させるために最適な選択を1つ選択してください。
+
+**重要**: ターゲットが自分で解決したいと感じている場合や、介入を望んでいない兆候がある場合は、no_interventionを選択することが最適です。人によっては干渉されることを嫌う場合があり、その場合は介入しない方が良好な関係を保てます。
+
+---
+
+【入力情報】
+- ターゲット話者の発話履歴（その人の発言のみ）
+- 各ペアの関係スコア（-1〜1）
+- 介入対象者（ターゲット）
+- 改善すべき関係ペア（エッジ）
+
+---
+
+【選択肢】
+1. validate — 感情や意見を承認し、心理的安全性を高める。ターゲットが共感や承認を求めている場合に有効。
+2. bridge — 対立している相手との共通点や協力軸を見つけ、調和を促す。ターゲットが仲裁を求めている場合に有効。
+3. plan — 具体的な行動方針を提案し、関係修復を前進させる。ターゲットが解決策を求めている場合に有効。
+4. no_intervention — ターゲットは自分で解決したい、または介入を望んでいない。放っておいてほしいと感じている場合に有効。
+
+---
+
+【判断基準】
+ターゲット話者の発話内容から、その人が今求めている心理的ニーズを推定してください。
+
+- 承認や共感を求めている発言が多い → 1 (validate)
+- 仲裁や協調を求めている発言が多い → 2 (bridge)
+- 具体的な解決策や行動計画を求めている発言が多い → 3 (plan)
+- 自分で解決したい、放っておいてほしいという態度が見られる → 4 (no_intervention)
+
+---
+
+【出力形式】
+- 数字1桁（1〜4）のみを出力してください。
+- 理由・説明・補足は出力しない。
+"""
+
+    # ターゲット話者の発話のみを含むプロンプト
+    prompt_lines = [
+        f"=== ターゲット話者（{target_speaker}）の発話履歴 ===",
+        *target_speaker_utterances,
+        "",
+        "=== 現在の関係スコア（-1〜1） ===",
+        ", ".join(f"w_{edge}={value:+.2f}" for edge, value in scores.items()),
+        "",
+        f"=== 改善対象エッジ === {target_edge}（現在: {target_score:+.2f}）",
+        f"=== 介入対象（ターゲット） === {target_speaker}",
+    ]
+    user_content = "\n".join(prompt_lines)
+
+    # ローカルLLMで生成
+    messages = [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content}
+    ]
+
+    # Qwen3の場合はenable_thinking=False
+    model_name = getattr(local_model, "config", None)
+    model_name_str = getattr(model_name, "_name_or_path", "") if model_name else ""
+    
+    if "Qwen3" in model_name_str:
+        prompt = local_tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False
+        )
+    else:
+        prompt = local_tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+
+    inputs = local_tokenizer(prompt, return_tensors="pt").to(local_model.device)
+
+    strategy_map = {
+        1: "validate",
+        2: "bridge",
+        3: "plan",
+        4: "no_intervention"
+    }
+
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            with torch.no_grad():
+                outputs = local_model.generate(
+                    **inputs,
+                    max_new_tokens=10,
+                    do_sample=True,
+                    temperature=0.3,
+                    top_p=0.9,
+                    pad_token_id=local_tokenizer.eos_token_id
+                )
+
+            response = local_tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
+            txt = response.strip()
+
+            if debug:
+                print(f"[local_llm] response: {txt}")
+
+            # 数字を抽出
+            strategy_num = None
+            for char in txt:
+                if char in '1234':
+                    strategy_num = int(char)
+                    break
+
+            if strategy_num:
+                strategy = strategy_map[strategy_num]
+                return strategy, target_edge, target_speaker, scores
+
+        except Exception as exc:
+            if debug:
+                print(f"[local_llm] attempt {attempt+1} failed: {exc}")
+            if attempt < max_attempts - 1:
+                time.sleep(0.5)
+
+    # フォールバック
+    if debug:
+        print("[local_llm] All attempts failed, returning random strategy")
+    strategy_num = random.randint(1, 4)
+    return strategy_map[strategy_num], target_edge, target_speaker, scores
+
+
 def test_single_session(
     session_id: int,
     cfg,
     speakers: List[str],
     persona_triggers: Dict[str, List[str]],
     used_triggers: List[str],
+    model_type: str = "gpt5",
+    local_model=None,
+    local_tokenizer=None,
     debug: bool = False
 ) -> Dict[str, Any]:
     """
     単一セッションのテストを実行
+
+    Args:
+        model_type: "gpt5" or "local"
+        local_model: ローカルLLMのモデル（model_type="local"時に必要）
+        local_tokenizer: ローカルLLMのトークナイザー（model_type="local"時に必要）
 
     Returns:
         テスト結果の辞書
@@ -537,14 +719,23 @@ def test_single_session(
 
     print()
 
-    # GPT-5で戦略を推定（学習環境と同じロジック）
-    gpt5_strategy, target_edge, target_speaker, scores = select_strategy_from_conversation(conversation, cfg, debug)
+    # モデルで戦略を推定
+    if model_type == "local":
+        if local_model is None or local_tokenizer is None:
+            raise ValueError("local_model and local_tokenizer are required for model_type='local'")
+        predicted_strategy, target_edge, target_speaker, scores = select_strategy_with_local_llm(
+            conversation, cfg, local_model, local_tokenizer, debug
+        )
+    else:  # gpt5
+        predicted_strategy, target_edge, target_speaker, scores = select_strategy_from_conversation(
+            conversation, cfg, debug
+        )
 
     # 対象話者の真のニーズと正解戦略
     true_need = true_needs[target_speaker]
     correct_strategy = NEED_TO_STRATEGY[true_need]
 
-    strategy_correct = (gpt5_strategy == correct_strategy)
+    strategy_correct = (predicted_strategy == correct_strategy)
 
     print(f"【関係性スコア】")
     for edge, score in scores.items():
@@ -555,7 +746,8 @@ def test_single_session(
     print(f"対象エッジ: {target_edge} (スコア: {scores[target_edge]:+.2f})")
     print(f"対象話者: {target_speaker}")
     print(f"真のニーズ: {true_need} ({NEED_DESCRIPTIONS[true_need]}) → 期待戦略: {correct_strategy}")
-    print(f"GPT-5の選択: {gpt5_strategy} (数字: {STRATEGY_TO_NUM[gpt5_strategy]})")
+    model_label = "ローカルLLM" if model_type == "local" else "GPT-5"
+    print(f"{model_label}の選択: {predicted_strategy} (数字: {STRATEGY_TO_NUM[predicted_strategy]})")
     print(f"結果: {'✓ 正解' if strategy_correct else '✗ 不正解'}")
 
     return {
@@ -569,8 +761,9 @@ def test_single_session(
         "target_speaker": target_speaker,
         "true_need": true_need,
         "correct_strategy": correct_strategy,
-        "gpt5_strategy": gpt5_strategy,
-        "strategy_correct": strategy_correct
+        "predicted_strategy": predicted_strategy,
+        "strategy_correct": strategy_correct,
+        "model_type": model_type
     }
 
 
@@ -598,7 +791,7 @@ def calculate_statistics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     # 戦略ごとの使用頻度
     strategy_counts = defaultdict(int)
     for result in results:
-        strategy_counts[result["gpt5_strategy"]] += 1
+        strategy_counts[result["predicted_strategy"]] += 1
 
     return {
         "strategy_estimation": {
@@ -612,13 +805,39 @@ def calculate_statistics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="GPT-5による戦略推定テスト")
+    parser = argparse.ArgumentParser(description="戦略推定精度テスト（GPT-5 & ローカルLLM対応）")
     parser.add_argument("--num-sessions", type=int, default=20, help="テストセッション数")
     parser.add_argument("--debug", action="store_true", help="デバッグ出力を有効化")
     parser.add_argument("--output-dir", type=str, default=None, help="出力ディレクトリ")
+    parser.add_argument("--model-type", type=str, choices=["gpt5", "local"], default="gpt5", 
+                        help="使用するモデル (gpt5: Azure OpenAI, local: ローカルLLM)")
+    parser.add_argument("--local-model", type=str, default=None,
+                        help="ローカルLLMのモデルパス（--model-type=local時に必要）")
     args = parser.parse_args()
 
     cfg = get_config()
+
+    # ローカルLLMのロード
+    local_model = None
+    local_tokenizer = None
+    if args.model_type == "local":
+        if args.local_model is None:
+            # デフォルト: config.yamlから取得
+            model_path = getattr(cfg.ppo, "model_name_or_path", "tokyotech-llm/Llama-3.1-Swallow-8B-Instruct-v0.5")
+            print(f"ローカルモデルが指定されていません。config.yamlから取得: {model_path}")
+        else:
+            model_path = args.local_model
+
+        print(f"ローカルLLMをロード中: {model_path}")
+        local_tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        local_model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            trust_remote_code=True
+        )
+        local_model.eval()
+        print(f"✓ ローカルLLMをロード完了")
 
     # 出力ディレクトリ
     if args.output_dir:
@@ -638,8 +857,12 @@ def main():
     used_triggers: List[str] = []
 
     print(f"{'='*60}")
-    print(f"GPT-5 戦略推定テスト")
+    model_label = "ローカルLLM" if args.model_type == "local" else "GPT-5"
+    print(f"{model_label} 戦略推定テスト")
     print(f"{'='*60}")
+    print(f"モデル: {model_label}")
+    if args.model_type == "local":
+        print(f"モデルパス: {model_path}")
     print(f"セッション数: {args.num_sessions}")
     print(f"地雷システム: 有効")
     for persona, triggers in persona_triggers.items():
@@ -655,6 +878,9 @@ def main():
             speakers=speakers,
             persona_triggers=persona_triggers,
             used_triggers=used_triggers,
+            model_type=args.model_type,
+            local_model=local_model,
+            local_tokenizer=local_tokenizer,
             debug=args.debug
         )
         results.append(result)
@@ -678,7 +904,7 @@ def main():
 
     # 統計表示
     print(f"\n{'='*60}")
-    print(f"GPT-5 戦略推定テスト結果")
+    print(f"{model_label} 戦略推定テスト結果")
     print(f"{'='*60}\n")
 
     print(f"テストセッション数: {args.num_sessions}\n")
