@@ -1024,7 +1024,6 @@ class TrainingRunLogger:
                             "strategy/bridge_ratio": strategy_counts.get("bridge", 0) / total,
                             "strategy/plan_ratio": strategy_counts.get("plan", 0) / total,
                             "strategy/no_intervention_ratio": strategy_counts.get("no_intervention", 0) / total,
-                            "strategy/output_error_ratio": strategy_counts.get("output_error", 0) / total,
 
                             # 戦略カウント
                             "strategy/validate_count": strategy_counts.get("validate", 0),
@@ -1039,27 +1038,11 @@ class TrainingRunLogger:
                             "strategy/plan_accuracy": plan_accuracy,
                             "strategy/no_intervention_accuracy": no_intervention_accuracy,
 
-                            # 戦略別正解数（新規追加）
-                            "strategy/validate_correct": strategy_correct_counts["validate"],
-                            "strategy/bridge_correct": strategy_correct_counts["bridge"],
-                            "strategy/plan_correct": strategy_correct_counts["plan"],
-                            "strategy/no_intervention_correct": strategy_correct_counts["no_intervention"],
-
-                            # 介入率メトリクス
-                            "intervention/rate": intervention_rate,
-                            "intervention/count": intervention_count,
-                            "intervention/no_intervention_count": no_intervention_count,
-                            "intervention/total_decisions": total,
-
                             # 戦略マッチングメトリクス
                             "preference/match_rate": preference_match_rate,
-                            "preference/match_count": preference_match_count,
-                            "preference/mismatch_count": total - preference_match_count,
 
                             # 対象エッジメトリクス（stable_bonus付与の前提条件）
                             "target_edge/positive_rate": target_edge_positive_rate,
-                            "target_edge/positive_count": target_edge_positive_count,
-                            "target_edge/negative_or_zero_count": total - target_edge_positive_count,
 
                             "step": self._interaction_count,
                         })
@@ -1158,7 +1141,7 @@ def build_robot_messages(
 ---
 
 【出力形式】
-- 数字1桁（1〜4）のみを出力してください。
+- 必ず数字1桁（1〜4）のみを出力してください。
 - 理由・説明・補足は出力しない。
 """
 
@@ -2510,6 +2493,9 @@ def main():
 
     ppo_config = PPOConfig(**ppo_config_kwargs)
     ppo_config.target_kl = _target_kl
+    
+    # モデル保存先を設定（後でmodel_run_dirに更新される）
+    ppo_config.output_dir = getattr(ppo_cfg, "output_dir", "../models/ppo_robot")
 
     # [FIX] PPOConfig初期化後に値が上書きされることがあるため、明示的に再設定
     if ppo_config.lr_scheduler_type != _lr_scheduler_type:
@@ -2553,6 +2539,16 @@ def main():
 
     run_id = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
     run_log_dir = Path("./logs") / f"ppo_run-{run_id}"
+    
+    # モデル保存用ディレクトリも先に作成
+    out_root = Path(getattr(ppo_cfg, "output_dir", "../models/ppo_robot"))
+    out_root.mkdir(parents=True, exist_ok=True)
+    model_run_dir = out_root / f"ppo_run-{run_id}"
+    model_run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[MODEL] Training artifacts will be saved to: {model_run_dir}")
+    
+    # PPOConfigのoutput_dirを更新
+    ppo_config.output_dir = str(model_run_dir)
 
     # wandb設定を読み込み
     enable_wandb = getattr(cfg.wandb, "enabled", True) if hasattr(cfg, "wandb") else True
@@ -2637,12 +2633,11 @@ def main():
     # 生成ハイパパラメータ（参考：必要なら trainer 側に渡す）
     # 新形式では1桁の数字のみ出力するため、max_new_tokensは小さくても良いが、
     # 安全のため10トークンに設定（数字1桁 + 余白）
-    # temperatureを1.0に設定して数値的安定性を向上
     gen_kwargs = dict(
         do_sample=True,
-        temperature=_to_float(getattr(ppo_cfg, "temperature", 1.0), 1.0),  # 0.7 -> 1.0（数値安定性向上）
+        temperature=_to_float(getattr(ppo_cfg, "temperature", 1.0), 1.0),
         top_p=_to_float(getattr(ppo_cfg, "top_p", 0.9), 0.9),
-        max_new_tokens=_to_int(getattr(ppo_cfg, "max_new_tokens", 10), 10),  # 安全のため10に増加
+        max_new_tokens=_to_int(getattr(ppo_cfg, "max_new_tokens", 10), 10),
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
     )
@@ -2661,7 +2656,15 @@ def main():
 
     entropy_floor_value = float(getattr(ppo_cfg, "entropy_floor", 0.0) or 0.0)
     entropy_patience_value = max(1, int(getattr(ppo_cfg, "entropy_patience", 1) or 1))
-    entropy_monitor_warmup = max(0, int(getattr(ppo_cfg, "entropy_monitor_warmup", 0) or 0))
+
+    # entropy_monitor_warmupが小数（割合）の場合、max_stepsに対する割合として処理
+    entropy_monitor_warmup_raw = getattr(ppo_cfg, "entropy_monitor_warmup", 0) or 0
+    if 0.0 < entropy_monitor_warmup_raw < 1.0:
+        entropy_monitor_warmup = max(0, int(entropy_monitor_warmup_raw * ppo_config.max_steps))
+        print(f"[PPO] entropy_monitor_warmup: {entropy_monitor_warmup_raw} → {entropy_monitor_warmup} (max_steps={ppo_config.max_steps})")
+    else:
+        entropy_monitor_warmup = max(0, int(entropy_monitor_warmup_raw))
+        print(f"[PPO] entropy_monitor_warmup: {entropy_monitor_warmup} (absolute value)")
 
     # 実効バッチサイズ: TRLが実行時に per_device_train_batch_size × grad_accum_steps × 2 で計算する
     
@@ -3387,6 +3390,9 @@ def main():
     trainer.entropy_target_phase2 = _to_float(getattr(ppo_cfg, "entropy_target_phase2", 0.5), 0.5)
     trainer.entropy_target_phase3 = _to_float(getattr(ppo_cfg, "entropy_target_phase3", 0.3), 0.3)
 
+    # エントロピーボーナスの上限を設定
+    trainer.max_entropy_bonus = _to_float(getattr(ppo_cfg, "max_entropy_bonus", 0.5), 0.5)
+
     # 実効バッチサイズ = per_device_train_batch_size × grad_accum_steps × 2
     effective_batch_size = ppo_config.per_device_train_batch_size * _ga * 2
 
@@ -3994,7 +4000,15 @@ def main():
 
     # 決定的評価を有効化（設定で制御）
     enable_deterministic_eval = getattr(ppo_cfg, "enable_deterministic_eval", True)
-    eval_frequency = getattr(ppo_cfg, "deterministic_eval_frequency", 10)
+    eval_frequency_raw = getattr(ppo_cfg, "deterministic_eval_frequency", 10)
+
+    # eval_frequencyが小数（割合）の場合、max_stepsに対する割合として処理
+    if 0.0 < eval_frequency_raw < 1.0:
+        eval_frequency = int(eval_frequency_raw * ppo_config.max_steps)
+        print(f"[EVAL] deterministic_eval_frequency: {eval_frequency_raw} → {eval_frequency} (max_steps={ppo_config.max_steps})")
+    else:
+        eval_frequency = int(eval_frequency_raw)
+        print(f"[EVAL] deterministic_eval_frequency: {eval_frequency} (absolute value)")
 
     if enable_deterministic_eval:
         deterministic_eval_callback = DeterministicEvalCallback(
@@ -4003,7 +4017,7 @@ def main():
             build_messages_fn=build_robot_messages,
             logger=training_logger,
             eval_frequency=eval_frequency,
-            output_dir=getattr(ppo_cfg, "output_dir", "../models/ppo_robot"),
+            output_dir=str(model_run_dir),  # ここもmodel_run_dirを使用
         )
         trainer.add_callback(deterministic_eval_callback)
         print(f"[EVAL] Deterministic evaluation enabled (frequency: every {eval_frequency} steps)")
@@ -4059,11 +4073,8 @@ def main():
 
     # --- 学習実行（内部で: 生成→報酬→PPO更新） ---
     total_updates  = _to_int(getattr(ppo_cfg, "total_updates", 50), 50)
-    out_root = Path(getattr(ppo_cfg, "output_dir", "../models/ppo_robot"))
-    out_root.mkdir(parents=True, exist_ok=True)
-    model_run_dir = out_root / f"ppo_run-{run_id}"
-    model_run_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[MODEL] training artifacts => {model_run_dir}")
+    # model_run_dirは既に作成済み（run_id作成時）
+    print(f"[MODEL] Training will use directory: {model_run_dir}")
 
     # TRL 0.23: train() は引数なし。データセットが尽きるまで学習。
     # ちょうど total_updates 回の PPO 更新にしたいので、上で total_samples を調整済み。
@@ -4077,10 +4088,19 @@ def main():
         trainer.train()
         
         print(f"[TRAIN_DEBUG] trainer.train() completed", flush=True)
-        print(f"[TRAIN_DEBUG] compute_loss was called {trainer._compute_loss_call_count} times", flush=True)
+        # _compute_loss_call_countは存在しない可能性があるため、getattr()で安全に取得
+        compute_loss_count = getattr(trainer, '_compute_loss_call_count', 'N/A')
+        print(f"[TRAIN_DEBUG] compute_loss was called {compute_loss_count} times", flush=True)
+        
+        # モデル保存
+        print(f"[SAVE] Starting model save to: {model_run_dir}", flush=True)
         final_dir = model_run_dir / "final"
         final_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[SAVE] Created directory: {final_dir}", flush=True)
+        
         trainer.save_model(str(final_dir))
+        print(f"[SAVE] trainer.save_model() completed", flush=True)
+        
         if training_logger is not None:
             training_logger.log_event(event="model_saved", path=str(final_dir))
 
